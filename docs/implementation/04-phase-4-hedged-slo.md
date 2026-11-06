@@ -11,7 +11,15 @@ git checkout -b feature/phase-4-hedged-slo
 
 Phase 3's index is correct and fresh. One replica that stalls still stalls the caller. This phase puts two replicas behind a coordinator that hedges, coalesces, and ejects a slow primary. The browser still does not exist. The SLO is the load-generator main. This phase has no test sources.
 
+Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
+
 ## Commit 1 — `feat: run a second index replica in its own consumer group`
+
+**What.** Two index services, `index-a` and `index-b`, each with its own consumer group, replica id, and host port. Both use `BOOTSTRAP=log`.
+
+**Why.** Hedging needs two complete copies. A shared consumer group with one partition delivers the log to only one of them, and the other sits empty. Every hedge would then hit a replica with no documents.
+
+**Significance.** The coordinator in the rest of this phase assumes both ports answer the same Ada query. A group id copied from one service to the other looks healthy in Compose and fails the moment the backup is used.
 
 Compose gains two services, `index-a` and `index-b`. They share the image you build locally. The least painful path: a `deploy/Dockerfile.index` that is `eclipse-temurin:21-jre` plus the `installDist` output copied in. Build it with `docker compose build` after `./gradlew :index:installDist`.
 
@@ -55,6 +63,12 @@ both health endpoints ready=true and the same Ada search ids
 
 ## Commit 2 — `chore: add the coordinator module`
 
+**What.** A new process on port 18483 that proxies search to `index-a` and proxies writes to the oracle. One attempt. No hedge yet. It depends on `:api` only.
+
+**Why.** Clients need one address, and that address must not be an index replica. Introducing the process as a straight proxy makes the hedge commit a behavior change on its own. Writes go to Postgres through the oracle and are not retried, because a hedged grant would race the row that is the source of truth.
+
+**Significance.** The browser in phase 5 talks only to this port. A coordinator that imports the index module would compile the replica's internals into the edge and hide the network hop the SLO is about.
+
 `settings.gradle.kts` includes `coordinator` and `loadgen`.
 
 `coordinator/build.gradle.kts` depends on `:api`, Jackson, slf4j, and logback. It does not depend on `:index` or `:oracle`. It has the application plugin, main class `io.aha.index.coord.CoordinatorMain`, default port `18483`.
@@ -81,6 +95,12 @@ curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' 'http://127.0.0.1:18483/v1/se
 ```
 
 ## Commit 3 — `feat: track replica latency with an EWMA and a p95 ring`
+
+**What.** `ReplicaStats` records successful latency samples. EWMA uses alpha 0.2 and starts at 20ms. p95 is a 64-sample ring, and until eight samples exist it returns 20ms. The primary is the lowest EWMA among replicas that are not ejected, with a lexicographic tie-break.
+
+**Why.** The hedge delay and the primary choice need a number that moves with the replica and forgets a single spike. EWMA is that number. p95 is the backup timer. The tie-break makes the same inputs pick the same replica, so a demo is explainable.
+
+**Significance.** Commit 4's hedge timer and commit 6's ejection both read this object. A primary chosen by error rate would keep a replica that is up and slow, which is the failure mode in the spec.
 
 `io.aha.index.coord.ReplicaStats`:
 
@@ -111,6 +131,12 @@ Verify:
 ```
 
 ## Commit 4 — `feat: hedge the backup replica at the primary p95`
+
+**What.** Send the search to the primary. If it has not returned by `min(20ms, that replica's p95)`, send one backup to the other replica. Return the first success. Cancel the loser. The internal deadline is 80ms.
+
+**Why.** Search is read-only, so a duplicate attempt is safe. One extra request is the cap: a second backup would amplify a brownout. The 20ms cap stops a poisoned p95 from waiting out the whole SLO before the backup is even sent.
+
+**Significance.** This is the mechanism behind "one copy of the index is slow and p99 still holds." Writes stay single-attempt. Copying this pattern onto `POST /v1/acl` would apply a grant twice.
 
 `io.aha.index.coord.HedgedSearch`:
 
@@ -159,6 +185,12 @@ Verify:
 
 ## Commit 5 — `feat: coalesce in-flight searches that share a replica and an epoch`
 
+**What.** `SingleFlight` joins identical searches that are already in flight. The key is tenant, user, normalized query, target replica, and that replica's advertised `aclEpoch`.
+
+**Why.** Two callers asking the same question at the same moment should share one replica call. Two callers in different epochs must not share a future: a post-revoke caller would otherwise receive a pre-revoke result that was already started.
+
+**Significance.** Coalescing is a latency tool with a security key. Dropping `aclEpoch` from the key is a leak that still looks like a cache hit in the logs.
+
 `io.aha.index.coord.SingleFlight<K, V>`:
 
 - `V doOrJoin(K key, Callable<V> call)`
@@ -201,6 +233,12 @@ Verify:
 
 ## Commit 6 — `feat: eject a replica that is alive and slow`
 
+**What.** Over a 60-second window of at least 20 requests, if more than 5% needed the hedge, the slow replica leaves the primary set for 30 seconds. It remains eligible as a hedge target.
+
+**Why.** Ejection uses latency, not errors. A replica that is up and slow is the case the spec names. Keeping it as a backup means a failure of the fast replica still has somewhere to go. Returning it after 30 seconds gives a recovered replica a way back.
+
+**Significance.** Without ejection, the hedge fires on every request and the extra load becomes the outage. The load-generator page in commit 10 should show the primary move to the fast replica while p99 stays under the line.
+
 Inside `ReplicaStats`, a window of 60 seconds:
 
 - `void recordAttempt(String primaryId, boolean hedgeFired, long nowMillis)`
@@ -230,6 +268,12 @@ Verify:
 
 ## Commit 7 — `feat: inject delay on one replica`
 
+**What.** `POST /admin/faults` sleeps the index handler for `delayMs` when `FAULTS_ENABLED=true`. The route is 404 when the flag is off. `GET` returns the current delay.
+
+**Why.** The SLO sentence is "even when one index replica is slow." A toggle makes that slowness repeatable without killing a process or depending on a garbage-collection pause. The flag defaults off so an ordinary start cannot be paused by an anonymous POST.
+
+**Significance.** Commit 10 and the phase-5 switch both call this route. A delay that is compiled into the scorer with no flag would ship inside the latency number you are trying to measure.
+
 On the index process, `POST /admin/faults` with body `{"delayMs":400}`.
 
 - If env `FAULTS_ENABLED` is not `true`, return 404 `NOT_FOUND` and do not change state.
@@ -256,6 +300,12 @@ curl -s -X POST localhost fault route, then a search whose elapsed time includes
 ```
 
 ## Commit 8 — `feat: emit Server-Timing on the coordinator`
+
+**What.** Every search response carries `Server-Timing` for `index`, `authz`, `hedge`, `lag`, and `coord`, plus `X-Replica` and `X-Hedged`. Fault-injection sleep is reported as `fault`, separate from `index`.
+
+**Why.** The 100ms line is server time. The header splits index, authorization, hedge, and coordinator so a client can quote the same numbers the server measured. Including the injected sleep inside `index` would make a drill look like a slow scorer.
+
+**Significance.** The load generator and the phase-5 widget both read `coord`. A p99 computed from client wall time mixes laptop network into the SLO and makes a healthy index look late.
 
 Every search response gets a `Server-Timing` header. Build it with `StringBuilder`, not string concatenation in a loop.
 
@@ -288,6 +338,12 @@ curl -sD - -o /dev/null -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' 'http://127.0
 ```
 
 ## Commit 9 — `perf: keep the scorer off the allocator`
+
+**What.** A pass over `QueryEngine` and `Postings`: primitive arrays, a size-10 score buffer, a thread-local candidate buffer, no per-document objects. Ada's and Ivan's curls stay the same. A JMH run prints allocations, and you paste the profile into `docs/benchmarks/phase4-alloc.md`.
+
+**Why.** Generational ZGC keeps pauses short. It does not make a per-document allocation free. Allocation rate still burns the cores the scorer needs. One visibility bitmap and the response objects are the budget; a `PriorityQueue` of boxed hits is not.
+
+**Significance.** The p99 in the next commit is measured after this pass. A green latency number on an allocating scorer will move the moment the corpus or the concurrency grows, and the profile is how you know which one you shipped.
 
 This commit is a pass over `QueryEngine` and `Postings`. Ada's and Ivan's curls stay the same.
 
@@ -327,6 +383,12 @@ docs/benchmarks/phase4-alloc.md pasted from jmh -prof gc
 ```
 
 ## Commit 10 — `perf: record p99 under 100ms with one replica delayed`
+
+**What.** `SloLoad` sends concurrent searches at the coordinator with `index-a` delayed 400ms. It exits 1 if any response is not 200, if the body contains the canary, or if p99 of `coord` is over 100ms. The printed line, the fault, and the machine go into `docs/benchmarks/phase4.md`.
+
+**Why.** This is the SLO, measured on the path a caller uses, with the failure mode the spec names. The canary is checked in the same run so a fast path that leaks and a correct path that stalls both show up together. Warmup is discarded so the figure is not a cold JVM.
+
+**Significance.** Tag `v0.4-slo` means this page exists and the number is at or under 100ms. Phase 5's widget draws the same line. Raising the threshold to make the run pass records a different product than the one the architecture describes.
 
 `loadgen` main `io.aha.index.loadgen.SloLoad`:
 

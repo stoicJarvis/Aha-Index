@@ -8,6 +8,8 @@ You build a correct search path that will miss the 100ms SLO on purpose. It is t
 
 This phase has no test sources. Each commit ends with `psql` or `curl`. The schema is the script in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7, copied into the migration file. Java follows section 0.6.
 
+Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it. Read those three lines before the file list.
+
 ```bash
 git checkout main
 git checkout -b feature/phase-1-naive-oracle
@@ -17,7 +19,13 @@ There is no `web/` directory in this phase. There is no Kafka.
 
 ## Commit 1 — `chore: scaffold the Java 21 Gradle build`
 
-Create the files below. Do not add search logic yet.
+**What.** A multi-module Gradle build for `:analysis`, `:api`, and `:oracle`, on the Java 21 toolchain, with Spotless and the version catalog from the setup guide. No search behavior yet.
+
+**Why.** The process split is a dependency rule. Putting the modules in place before any query code means the oracle cannot quietly start importing the index, because the index module does not exist and the graph already points the other way.
+
+**Significance.** Phases 2 and 4 add processes that share JSON types and the tokenizer. If those types are born inside the oracle server, every later process either duplicates them or takes a dependency on the HTTP server. This commit is the seam they plug into.
+
+Create the files below. Search logic waits until commit 6.
 
 `.gitignore`:
 
@@ -150,6 +158,12 @@ java -version
 
 ## Commit 2 — `chore: run Postgres 16 and prove JDBC connects`
 
+**What.** Postgres 16 in Compose, with logical WAL already enabled, plus a JDBC ping from the oracle module through `DbConfig` and `DataSourceFactory`.
+
+**Why.** The oracle and the later candidate check both read this database. `wal_level=logical` is unused until phase 3, and changing it later destroys the data directory. Proving `SELECT 1` now separates "Docker and JDBC work" from "the schema is right."
+
+**Significance.** A freshness demo in phase 3 replays this same volume. A database created without a replication slot budget cannot grow a Debezium connector without a wipe, and a wipe throws away the corpus you are about to seed.
+
 `deploy/docker-compose.yml`:
 
 ```yaml
@@ -222,6 +236,12 @@ docker compose -f deploy/docker-compose.yml ps
 
 ## Commit 3 — `feat: add the allow-grant schema and a migration runner`
 
+**What.** The section 0.7 script becomes `V001__init.sql`, applied by a runner that records a SHA-256 checksum and refuses a changed script that was already applied.
+
+**Why.** Visibility is the existence of an allow row. The table has no boolean to flip by mistake, the principal trigger rejects a grant to nobody, and row-level security is a second fence behind `tenant_id`. The checksum is how a later edit of `V001` is caught before it is applied to a database that already ran the old bytes.
+
+**Significance.** Every later phase trusts these table names, this default-deny rule, and this primary key. Debezium will publish these tables. A second copy of the model, or a flag on `documents`, makes "who can read this" depend on which process you asked.
+
 `oracle/src/main/resources/db/migration/V001__init.sql` is the script in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7, byte for byte. That script creates schema `search`, the version table with a SHA-256 checksum, named constraints, `timestamptz` columns, the principal trigger, row-level security, and the `aha_app` role.
 
 `REPLICA IDENTITY` stays `DEFAULT`. A delete event carries the primary key, which is what phase 3's applier needs.
@@ -261,6 +281,12 @@ psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "\dt search.*"
 
 ## Commit 4 — `feat: add the shared tokenizer`
 
+**What.** One final class, `Tokenizer`, in `:analysis`. NFKC, root-locale lowercase, runs of letters and digits. No stemming, no stop-word list. Both `tokens` and `termFreq`.
+
+**Why.** The oracle in this phase and the index in phase 2 have to agree on what a match is. One class makes a ranking difference a ranking difference. Stemming would make the same document look different under two implementations and the curl comparison would be meaningless.
+
+**Significance.** Phase 2's BM25 and this phase's count score both call this class. If the index tokenizes on its own, "same hits as the oracle" stops being a check you can make with curl.
+
 Package `io.aha.index.analysis.Tokenizer`. Implement the algorithm in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.8. The class is final. Methods are pure. No logging.
 
 These inputs are the contract. Commit 7's hit list is wrong when any row here is wrong.
@@ -291,6 +317,12 @@ Verify:
 ```
 
 ## Commit 5 — `feat: seed the canary corpus`
+
+**What.** Two tenants, overlapping groups, and a fixed set of documents. `d-canary` matches the same words as ordinary documents and is granted only to Ivan. `d-orphan` has no grant. Forty filler documents are granted to contractors. Seeding twice leaves the same rows.
+
+**Why.** The canary is the leak detector: any missing tenant or ACL predicate returns it to Ada. The fillers are the limit detector: an unfiltered `LIMIT 10` hides Ada's documents behind Neil's corpus. A second tenant makes a missing `tenant_id` predicate fail in a way a single-tenant seed cannot.
+
+**Significance.** Every later curl, freshness script, and benchmark uses these ids. Changing the body text or the grants changes the expected hit list for the rest of the project.
 
 `io.aha.index.oracle.CorpusSeeder.seed(Connection)` runs on the admin connection. It deletes, in foreign-key order, `acl_entries`, `group_memberships`, `documents`, `groups`, `users`, `tenants`, then inserts the rows below. It runs in one transaction. Calling it twice yields the same rows. Set `app.maintenance` is unnecessary on the admin connection because the owner bypasses row-level security.
 
@@ -359,6 +391,12 @@ psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "SELECT count(*) FROM s
 ```
 
 ## Commit 6 — `feat: list the documents a user can read`
+
+**What.** One SQL fragment, `VisibilitySql.PREDICATE`, and `DocumentStore` methods that list visible documents, confirm a candidate id list, and write documents, grants, and memberships. Inserting a document does not grant the author.
+
+**Why.** This predicate is the product rule: a direct user grant, or a group grant plus a current membership, inside the same tenant. Search and the later candidate check both paste this constant. A second copy will drift, and the drift is a document shown to the wrong person. A new document with no grant fails closed.
+
+**Significance.** Phase 2's bitmap is an acceleration of this query, and phase 2 still calls `retainVisible` on the final candidates because a bitmap can lag a revoke. If this SQL is wrong, the fast path confirms the wrong answer faster.
 
 `io.aha.index.oracle.VisibilitySql`:
 
@@ -453,6 +491,12 @@ psql as aha_app with app.tenant_id=acme, Ada's visible ids are d-ada-1, d-eng-1,
 
 ## Commit 7 — `feat: rank the visible set in memory and return ten hits`
 
+**What.** `NaiveSearch` loads every document the user may read, keeps those that contain every query token, scores them with `3 * title count + 1 * body count`, and returns at most 10. The SQL has no `LIMIT`.
+
+**Why.** The database returns the whole visible set, and ranking happens after that filter. An unfiltered keyword query with `LIMIT 10` returns the first ten matching rows in the table, which are Neil's fillers, and Ada's documents disappear. The slowness is the lesson commit 9 writes down.
+
+**Significance.** This class is the authority for "these ids, for this user." Phase 2 may change the score to BM25. It may not change who is allowed to see a row. The curl order in the next commit is the record of this score.
+
 `io.aha.index.oracle.NaiveSearch`:
 
 ```java
@@ -517,6 +561,12 @@ Verify:
 ```
 
 ## Commit 8 — `feat: serve the oracle over HTTP`
+
+**What.** The JSON records in `:api`, and an HTTP server on port 18480: search, document read, document write, ACL, membership, directory, and health. Demo headers are read only by `PrincipalResolver`. Writes commit to Postgres and the next search sees them.
+
+**Why.** The response fields (`hits`, `mode`, `replica`, `hedged`, `aclEpoch`, `watermarkLagMs`) are fixed here so later processes can replace the implementation. The oracle has no cache, which is why a grant is visible on the next search. Token mode returns 401 so the demo headers are a harness, not a credential.
+
+**Significance.** The coordinator, the load generator, and the console all speak this shape. A field renamed in phase 4 breaks every client that already parsed phase 1. Search is the only route later phases are allowed to hedge, because these writes are the source of truth.
 
 `io.aha.index.api` records, Jackson-friendly (public accessors, no logic):
 
@@ -610,6 +660,12 @@ LIMIT 10;
 Run it as `aha` and compare the ids with Ada's curl. They differ. `NaiveSearch` keeps the filter in the SQL and limits after ranking.
 
 ## Commit 9 — `docs: record the phase-1 latency baseline`
+
+**What.** A benchmark main grows the tenant to at least 5,000 documents and records min, p50, p99, and max for Ada's `quarterly` search, plus the `EXPLAIN` plan, in `docs/benchmarks/phase1.md`.
+
+**Why.** The SLO is 100ms at p99. This commit writes down that the correct oracle misses it, and by how much, before any index exists. An index on `body` that makes this fast would hide the reason phase 2 exists.
+
+**Significance.** Phase 2's benchmark is a comparison against this page. Without the number and the sequential plan, "the index is faster" has nothing to be faster than.
 
 `io.aha.index.oracle.NaiveBenchmark` is a `main` under `src/main`. It:
 

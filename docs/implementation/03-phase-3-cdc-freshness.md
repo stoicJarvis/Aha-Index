@@ -13,7 +13,15 @@ You already have a correct index that is stale for grants until restart. This ph
 
 Still no frontend. The freshness probe is `deploy/freshness.sh`. This phase has no test sources.
 
+Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
+
 ## Commit 1 — `chore: run Kafka KRaft and Debezium Connect beside Postgres`
+
+**What.** Compose gains one Kafka broker in KRaft mode and a Debezium Connect worker, beside the Postgres you already have. No connector is registered yet.
+
+**Why.** The search path has to learn about commits from the WAL. Polling the tables either misses the 30 second bound under load or hammers Postgres on the same budget as queries. KRaft drops ZooKeeper from a single-node demo. Getting the brokers healthy is its own commit so a bad connector config is not confused with a broker that never started.
+
+**Significance.** Both index replicas in phase 4 read this log. An offset committed before the snapshot is published, or a broker that only one replica can see, skips a revoke on one of them.
 
 Extend `deploy/docker-compose.yml`. Keep the Postgres service. Add:
 
@@ -108,6 +116,12 @@ curl -sf http://127.0.0.1:18083/connectors
 ```
 
 ## Commit 2 — `feat: register the Postgres connector with transaction metadata`
+
+**What.** A connector config that publishes `documents`, `acl_entries`, and `group_memberships`, with transaction metadata on, into topics the index will consume. One partition per topic. The register script posts that config to Connect.
+
+**Why.** A document and its grant commit in one Postgres transaction and must become visible at one LSN. Transaction metadata is how the applier sees that boundary. Separate table topics are not ordered against each other; the transaction id is what stitches them back together.
+
+**Significance.** Without the end marker, the applier would publish a document before its grant, or a revoke after the content it protects had already been served. That torn window is the bug this connector setting exists to close.
 
 `deploy/connector.json`:
 
@@ -213,6 +227,12 @@ topics aha.public.documents, aha.public.acl_entries, aha.transaction exist
 
 ## Commit 3 — `feat: parse Debezium events and buffer a transaction`
 
+**What.** Types for a Debezium envelope and a `TransactionBuffer`. Snapshot reads apply immediately. Streaming rows wait until the matching END marker arrives with `event_count`, then flush in `total_order`.
+
+**Why.** The data topic and the transaction topic are written independently, so END can arrive before the rows. The buffer holds a pending END and flushes when the counts match. A duplicate offset is dropped. A truncate is a hard failure because these tables are not truncated.
+
+**Significance.** The applier in the next commit assumes the list it receives is one committed transaction, in order, once. A buffer that flushes early republishes the torn write the connector was added to prevent.
+
 Add `kafka-clients` to the index module.
 
 `io.aha.index.idx.cdc.ChangeEvent` is a sealed interface:
@@ -254,6 +274,12 @@ Verify:
 ```
 
 ## Commit 4 — `feat: apply a transaction into one published snapshot`
+
+**What.** The applier is the only writer. It applies a buffered transaction as one new snapshot, ignores an event at or below `appliedLsn`, publishes with one volatile write, and only then is the consumer offset safe to commit.
+
+**Why.** Delivery is at-least-once. Idempotence is the LSN check: a replay is a no-op, a crash does not skip a revoke. Offset commit after publish means a crash between publish and commit replays work that is already in memory, which is safe, and a crash before publish retries work that was not visible, which is also safe.
+
+**Significance.** Committing the offset first is how a revoke disappears from the log and stays in the index. This order is the freshness invariant phase 4's two replicas each keep for themselves.
 
 `io.aha.index.idx.cdc.Applier` holds the per-tenant `IndexBuilder`s from phase 2. It is the only writer.
 
@@ -298,6 +324,12 @@ Verify:
 
 ## Commit 5 — `feat: rebuild from the log on start and fail closed when the log is stale`
 
+**What.** On start and on partition assignment, the consumer seeks to the beginning and rebuilds memory from the log. `ready` stays false until that replay goes quiet. Search returns 503 while not ready, and when `now - lastAppliedEventTime` exceeds the freshness threshold.
+
+**Why.** In-memory state dies on restart. A committed offset with empty memory would skip a revoke. Replay is safe because grant, revoke, upsert, and delete are absolute. The watermark covers the other direction: a grant the consumer has not applied is missing from the bitmap, and past 30 seconds that miss becomes a 503 instead of a quietly incomplete index.
+
+**Significance.** Serving a stale allow-set to keep latency would satisfy the p99 sentence and break the security sentence. Fail-closed is how both stay true. Phase 4 hedges only among replicas that pass this gate.
+
 `io.aha.index.idx.cdc.LogConsumer`:
 
 - Properties: `bootstrap.servers` from `KAFKA_BOOTSTRAP` default `127.0.0.1:19092`. `group.id` from `CONSUMER_GROUP` default `index-replica-a`. `enable.auto.commit=false`. `auto.offset.reset=earliest`. `key.deserializer` and `value.deserializer` are `StringDeserializer`. `isolation.level=read_committed`. `max.poll.interval.ms=300000`.
@@ -332,6 +364,12 @@ curl -s http://127.0.0.1:18481/v1/health
 ```
 
 ## Commit 6 — `feat: show grant and revoke propagation on the compose log`
+
+**What.** `deploy/freshness.sh` grants through the oracle, polls the index until the document appears, revokes, polls until it disappears, then checks that a paused consumer with `FRESHNESS_SLO_MS=1000` returns 503. Elapsed times go into `docs/benchmarks/phase3.md`.
+
+**Why.** The SLO is a wall-clock bound on the path from a Postgres commit to a search hit. JDBC bootstrap still hides a new grant until restart. This script is the record that the log path shows it, and that a stuck consumer refuses to answer.
+
+**Significance.** Phase 4's load run is only meaningful on a replica that already passes this script. A p99 measured against a bitmap that never sees a grant is a latency number for the wrong system.
 
 `deploy/freshness.sh` runs against the Compose stack. Ports 18480 (oracle writes) and 18481 (index reads).
 

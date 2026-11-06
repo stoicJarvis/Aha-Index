@@ -2,6 +2,8 @@
 
 Start this phase only after `git tag --list 'v0.4-slo'` prints `v0.4-slo`. The backend SLO is already proven without a browser. The UI is how a person sees that proof.
 
+Every commit opens with what it changes, why that change stands alone, and the significance for the demo.
+
 Branch: `feature/web-search-console`
 
 Tag: `v0.5-console`
@@ -12,6 +14,12 @@ git checkout -b feature/web-search-console
 ```
 
 ## Commit 1 — `chore: scaffold the Next.js console`
+
+**What.** A Next.js app in `web/`, TypeScript, Tailwind, and the shadcn primitives the later commits use. No search behavior yet. Node arrives in this phase.
+
+**Why.** The console is a harness and a latency instrument. It waits until `v0.4-slo` so the UI is built against a backend that already meets the bound, and so earlier phases stay Java, Postgres, Kafka, and Debezium.
+
+**Significance.** The pages that follow share one app router and one set of primitives. A second frontend, or a `src/` layout invented mid-phase, splits the switcher, the search page, and the telemetry card into components that do not share principal state.
 
 Install Node 22 LTS. `node -v` prints v22.
 
@@ -62,6 +70,12 @@ cd web && npm run build
 ```
 
 ## Commit 2 — `feat: add a principal switcher that sends demo headers`
+
+**What.** Two selects, tenant then user, filled from `GET /v1/directory`. The choice lives in `sessionStorage`. Changing it replaces the demo headers, clears hits, and aborts an in-flight search. The coordinator emits CORS only for the console's origin.
+
+**Why.** Demo mode is a harness. The switcher is the only UI that sets `X-Tenant-Id` and `X-User-Id`. Users shown are the directory entries for the selected tenant. The server still checks tenant and membership on every request; the client filter is hygiene.
+
+**Significance.** A slow response for Ada must not paint after you have switched to Ivan. Clearing the list in this commit, and aborting the request in the next, is how the console avoids showing one user's hits under another user's name.
 
 The coordinator in demo mode trusts `X-Tenant-Id` and `X-User-Id`. The switcher is the only place the browser sets them.
 
@@ -121,6 +135,12 @@ cd web && npm run build
 Manual check, written into the commit body under `Verify:` as well: load the page, pick Ivan, see the badge change. You will not have search results yet.
 
 ## Commit 3 — `feat: debounce search input and abort the previous request`
+
+**What.** The input updates on every keystroke. A 120ms debounce feeds the query that is fetched. Each fetch gets an `AbortController`. A new query, a principal change, or an unmount aborts the previous one. Aborted responses are not written into state.
+
+**Why.** The person sees the characters they typed. The request waits long enough to avoid a fetch per key, and short enough that a deliberate pause still searches. Aborting is what stops a slow query for Ada from landing after the switch to Ivan.
+
+**Significance.** This is the client half of the isolation the server already enforces. A cache key without tenant and user, or a 503 replaced by a cached hit list, is the client-side version of serving a stale allow-set.
 
 `web/app/page.tsx` is the console. One column on a narrow viewport. On `min-width: 768px`, the result list and the telemetry card (empty for now) sit in a two-column grid.
 
@@ -218,6 +238,12 @@ Manual: type `quarterly` as Ada. You see `d-ada-1`, `d-eng-1`, `d-shared`, and y
 
 ## Commit 4 — `feat: show server time against the 100ms line`
 
+**What.** A telemetry card reads `Server-Timing` and `performance.now()`. It shows server milliseconds, network milliseconds, replica, hedge, and lag, plus p50 and p99 of the last 50 server samples for this principal, with a mark at 100ms.
+
+**Why.** Client RTT includes the laptop network. The SLO line is server time, which is the sum of the `Server-Timing` durations. Showing both stops a slow network from being told as an index miss. Samples reset when the principal changes so one user's latency is not reported as another's.
+
+**Significance.** The number a demo quotes is the p99 on this card, from the same `coord` metric the load generator used. A chart of `performance.now()` alone measures a different thing than `docs/benchmarks/phase4.md`.
+
 `web/lib/server-timing.ts`:
 
 ```ts
@@ -268,6 +294,12 @@ Manual: with `index-a` delayed 400ms and `index-b` healthy, search as Ada. The c
 
 ## Commit 5 — `feat: grant, revoke, and measure propagation from the console`
 
+**What.** A permissions sheet grants or revokes the canary for the active user, then re-issues the search until the result flips or 30 seconds pass. It displays the elapsed time. A 503 clears the cached hits and shows the fail-closed message.
+
+**Why.** Phase 3 proved propagation with a shell script. This commit makes the same bound visible: a grant or revoke committed through the coordinator, then a search that changes, with the wait on screen. Cached hits stay on screen through a 503 only if the console is willing to show a list the server just refused.
+
+**Significance.** The freshness sentence of the spec is something a person can watch. The probe uses its own abort controller and stops if the principal changes mid-wait, so Ivan's revoke probe cannot update Ada's results.
+
 A shadcn `Sheet` titled "Permissions", triggered by a `Button` "Edit access".
 
 Fields:
@@ -312,6 +344,12 @@ manual grant and revoke of d-canary as Ivan, seed restored
 
 ## Commit 6 — `feat: toggle a slow replica from the console`
 
+**What.** A switch posts `delayMs: 400` for `index-a`, and posts `0` when it is turned off. The telemetry card is where the effect shows up: the primary changes, hedges increase, and server p99 stays at or under 100ms.
+
+**Why.** The fault route already exists for the load generator. The switch is how a person turns that fault on during a demo and reads the result on the same card as a normal search.
+
+**Significance.** This is the "one replica is slow" sentence, visible. A toggle that only changes a label, without the fault call, demonstrates nothing about hedging.
+
 A switch "Delay index-a by 400ms". It `POST`s `/admin/faults/replica` through the coordinator. Turning it off posts `delayMs: 0`.
 
 If the coordinator returns 404, the card shows "Fault injection is off. Start the coordinator with FAULTS_ENABLED=true." The switch does not pretend it worked.
@@ -335,6 +373,12 @@ toggle on, search, card shows index-b and server time at or under 100ms
 ```
 
 ## Commit 7 — `docs: write the demo script`
+
+**What.** `docs/demo.md` is the ten-step script for a walkthrough: who Ada and Ivan are, the canary, a grant and a revoke with the measured delay, the slow-replica switch, and the 100ms line. It includes a pass at 375px wide.
+
+**Why.** The console has a lot of state. The script is the order that shows isolation, freshness, and the SLO without skipping the step where those claims can fail.
+
+**Significance.** Tag `v0.5-console` means this script has been run once, including the narrow window. A UI that looks right and has not been walked through in that order can still paint the wrong user's hits or hide a 503 behind a cache.
 
 `docs/demo.md` is the script you follow in a portfolio walkthrough. Ten steps, each one sentence plus the URL or command:
 

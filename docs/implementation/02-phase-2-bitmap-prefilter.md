@@ -13,6 +13,8 @@ git checkout -b feature/phase-2-bitmap-prefilter
 
 This phase has no test sources. Where a check names expected ids or a score, confirm it with `curl` or `psql` against Compose. `./gradlew :index:compileJava` is the compile check.
 
+Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
+
 Phase 2 loads the index from Postgres at startup. A grant committed after startup is invisible to the bitmap until restart. The Postgres candidate check from `DocumentStore.retainVisible` still drops a revoke immediately, because it reads current rows. New grants wait for phase 3. Say that in the module's package javadoc so you do not "fix" it with a cache invalidator.
 
 Add to `settings.gradle.kts`:
@@ -22,6 +24,12 @@ include("index")
 ```
 
 ## Commit 1 — `chore: add the index module`
+
+**What.** A new Gradle module `:index` with its own `main`, depending on analysis, api, the oracle's visibility store, and RoaringBitmap. It prints a boot line and exits.
+
+**Why.** The index is a separate process from the oracle. It may call `VisibilityStore`. The oracle must not depend on the index. Creating the module before the data structures keeps that arrow in one direction.
+
+**Significance.** Phase 3's consumer and phase 4's two replicas are this same process, started twice. A search path that grew inside the oracle would have to be cut apart under a live SLO.
 
 `index/build.gradle.kts`:
 
@@ -78,6 +86,12 @@ Verify:
 
 ## Commit 2 — `feat: assign dense doc ids and store document records`
 
+**What.** `DocTable` assigns a dense `int` the first time it sees an external id, in call order, and stores title, body length, and token count under that int.
+
+**Why.** Roaring bitmaps and postings want 32-bit keys. A `HashSet` of UUID strings dominates both memory and intersection time. The loader in commit 8 calls this in external-id order, so the dense id follows `docId` ascending and the tie-break stays stable.
+
+**Significance.** Every bitmap, posting, and score in the rest of the index is an int from this table. Reassigning ids on restart, or recycling an id after a delete, makes a revoke land on the wrong document.
+
 `io.aha.index.idx.DocTable`
 
 - `int assign(String externalId)` — if the id exists, return the existing int. Otherwise append. The first id is 0.
@@ -105,6 +119,12 @@ Verify:
 
 ## Commit 3 — `feat: build sorted postings lists`
 
+**What.** For each term, a sorted array of dense doc ids plus a parallel array of term frequencies. A cursor walks that array with `next` and galloping `advanceTo`.
+
+**Why.** Conjunction is an intersection of sorted lists, rarest term first. Galloping finds the next candidate without scanning every id when one list is much longer than the other. The frequency sits beside the id so scoring does not rescan the body.
+
+**Significance.** Commit 7 intersects these lists with the visibility bitmap. A posting list that is unsorted, or whose frequency array has a different length, returns the wrong document or the right document with a silent score.
+
 `io.aha.index.idx.Postings`
 
 - `void add(String term, int docId)` — insert `docId` into that term's sorted `int[]`. Binary search. If it is already present, return. Grow the array by doubling. Keep a parallel `size`.
@@ -130,6 +150,12 @@ Verify:
 ```
 
 ## Commit 4 — `feat: score with BM25 into a fixed top-10 heap`
+
+**What.** BM25 with `k1 = 1.2` and `b = 0.75`, and a heap that keeps ten `(docId, score)` pairs. Tie-break is the dense id ascending.
+
+**Why.** The phase-1 score was a term count, good enough to prove who can see a document and too crude to be the product rank. BM25 is the score the service promises. A fixed heap of ten means ranking does not allocate a scored object per candidate.
+
+**Significance.** The curl comparison with the oracle is on ids and visibility. The order inside those ids is this formula. A second implementation of BM25 that calls the production class cannot catch a bug in it, which is why the reference calculation is typed again from the architecture note.
 
 `io.aha.index.idx.Bm25`
 
@@ -182,6 +208,12 @@ Verify:
 
 ## Commit 5 — `feat: publish index snapshots through a volatile field`
 
+**What.** An immutable `IndexSnapshot`, and a publisher that stores it in a `volatile` field. Readers load that field. The writer mutates only a builder that has not been published.
+
+**Why.** Publication is single-writer, many-readers. A reader that loads the volatile field happens-before every write the builder finished before the store. Roaring bitmaps are not safe to mutate while another thread reads them, so the snapshot clones bitmaps before it becomes visible.
+
+**Significance.** Phase 3's applier has nowhere to publish a new generation except this field. If query threads take a lock, or if a published bitmap is still being `or`-ed, the freshness path and the latency path fight over the same object.
+
 `io.aha.index.idx.IndexSnapshot` is a final class. Fields are private and not mutated after the constructor returns. It holds:
 
 - `DocTable docs` — treat as frozen after publish. The next writer clones or builds a new table.
@@ -226,6 +258,12 @@ Verify:
 ```
 
 ## Commit 6 — `feat: encode allow-grants as roaring bitmaps`
+
+**What.** Per tenant, a user bitmap, a group bitmap, a small membership array, and a live-doc bitmap. The visible set is a clone of the user bitmap, OR-ed with each group bitmap, AND-ed with live docs.
+
+**Why.** Enterprise ACLs are sparse: many documents, fewer groups, users who inherit through groups. Roaring keeps sparse sets in arrays and dense sets in bitsets, and the intersection never materializes a Java `Integer` per document. The clone matters: an in-place OR into the published user bitmap permanently grants that user every document in the group.
+
+**Significance.** This is the acceleration structure, not the authority. It can lag a revoke by seconds. Commit 8's Postgres confirm exists because a bitmap-only answer would bring that lag back as a leak.
 
 Builder `io.aha.index.idx.IndexBuilder`:
 
@@ -281,6 +319,12 @@ Verify:
 ```
 
 ## Commit 7 — `feat: intersect postings with the visibility bitmap before scoring`
+
+**What.** Order query terms by document frequency, rarest first. Intersect postings. Intersect the survivor set with the visibility bitmap as soon as that bitmap is more selective than the next term. Score survivors into the size-10 heap.
+
+**Why.** Phase 1 filtered after collecting matches, so cost tracked the whole corpus. Pre-filter cost tracks the documents the user can read. Scoring a hundred hits and keeping one is the bug this commit removes, and the scored-document count is how you see that it happened.
+
+**Significance.** The phase-2 benchmark's story is this order of operations. A post-filter that looks correct on Ada's three documents still falls over when the unauthorized corpus grows, which is the case commit 10 measures.
 
 `io.aha.index.idx.QueryEngine.search(IndexSnapshot snap, String userId, String query)`:
 
@@ -363,6 +407,12 @@ Verify:
 
 ## Commit 8 — `feat: load a snapshot from Postgres and confirm candidates`
 
+**What.** At startup, one repeatable-read transaction loads documents, grants, and memberships into a snapshot per tenant. After BM25, `retainVisible` confirms candidate ids in batches of 30, at most five batches. A SQLException becomes 503, and the unconfirmed list is not returned.
+
+**Why.** The bitmap can be stale after a revoke until the process restarts. The confirm query is a primary-key lookup of a handful of ids, which is the difference from phase 1's sequential scan. A grant that arrives after startup is absent until reload. That limit is written in the class Javadoc so phase 3 has a behavior to remove, and so nobody "fixes" it with a cache flush in this phase.
+
+**Significance.** One global bitmap with colliding doc ids across tenants is a cross-tenant leak, which is why the snapshot is keyed by tenant. Skipping `retainVisible` makes the index faster and wrong the moment a revoke commits.
+
 `io.aha.index.idx.JdbcBootstrap`:
 
 1. Open a connection, `setAutoCommit(false)`, `setTransactionIsolation(REPEATABLE_READ)`.
@@ -406,6 +456,12 @@ Verify:
 
 ## Commit 9 — `feat: serve the index on port 18481`
 
+**What.** A read-only HTTP server. Search and health use the same JSON as the oracle, with `mode=indexed`. Writes stay on the oracle port. Startup assumes the schema and the seed already exist and bootstraps with `BOOTSTRAP=jdbc`.
+
+**Why.** The process boundary is real from here on. The oracle remains the writer and the visibility authority on 18480. The index serves reads from the snapshot. One search handler also covers `/internal/search`, so the coordinator in phase 4 does not grow a second parser.
+
+**Significance.** Two ports mean you can curl the same query at both and compare ids. A write route added on the index would create a second source of truth next to Postgres.
+
 `IndexServer` mirrors `OracleServer` routes that are reads:
 
 - `GET /v1/health` returns `mode=indexed`, `ready`, `appliedLsn`, `lagMs`. In this phase `appliedLsn` is 0 and `lagMs` is 0 when ready.
@@ -434,6 +490,12 @@ Verify:
 ```
 
 ## Commit 10 — `docs: record post-filter cost against pre-filter cost`
+
+**What.** `SelectivityBenchmark` times a user who can read 0.1% of 20,000 documents against a user who can read all of them, and writes `docs/benchmarks/phase2.md`. Confirm is off for this measurement and on in the server. A post-filter that lives only in the benchmark scores the global top and then drops unauthorized hits.
+
+**Why.** The sparse user is the case where ranking the whole corpus and then dropping unauthorized hits returns the wrong set and does more work. The numbers belong next to the phase-1 baseline so the lesson is a measurement, not a claim.
+
+**Significance.** Phase 4's p99 is believable only if this page already shows that cost follows the visible corpus. A benchmark that leaves confirm on is still useful, and it is a different number; the page says which one you measured.
 
 Extend the benchmark seeder idea. A main `SelectivityBenchmark`:
 
