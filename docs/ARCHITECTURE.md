@@ -24,7 +24,7 @@ Invariants:
 | Piece | Choice | Pinned in the guides |
 | --- | --- | --- |
 | Language | Java 21 | Temurin 21, Gradle wrapper 8.11.1 |
-| HTTP | `com.sun.net.httpserver.HttpServer` | No Spring, no Javalin |
+| HTTP | Spring Boot 3.5.16, `spring-boot-starter-web` | Tomcat, virtual threads enabled. Jackson comes from the Spring Boot BOM |
 | Index | Hand-built in-memory postings, BM25, roaring bitmaps | `org.roaringbitmap:RoaringBitmap:1.6.29` |
 | System of record | PostgreSQL 16 | `postgres:16` |
 | Change capture | Debezium Postgres connector 3.7.0.Final | `pgoutput`, transaction metadata on |
@@ -41,9 +41,23 @@ RoaringBitmap, the Kafka client, and Debezium's connector are JVM libraries. The
 
 Publication is single-writer, many-readers. The applier builds a snapshot and stores it in a `volatile` field. A reader that loads that field happens-before the writes that built it. `RoaringBitmap` mutation is single-threaded. Query code clones or reads a bitmap that has already been published. It does not call `add` on a bitmap another thread can see.
 
-Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational` on Java 21) keeps pauses out of the 100ms budget. Pause time is not allocation rate. The scorer uses primitive postings, a reused size-10 heap, and roaring containers. Virtual threads run the phase-1 JDBC server and blocking HTTP calls in the coordinator. The scorer itself runs on a small platform-thread pool: a CPU-bound intersection does not get faster by adding virtual threads.
+Generational ZGC (`-XX:+UseZGC -XX:+ZGenerational` on Java 21) keeps pauses out of the 100ms budget. Pause time is not allocation rate. The scorer uses primitive postings, a reused size-10 heap, and roaring containers. Spring MVC request threads are virtual (`spring.threads.virtual.enabled=true`). The scorer itself runs on a small platform-thread pool: a CPU-bound intersection does not get faster by adding virtual threads.
 
-External HTTP is JSON (Jackson 2.21.2). Replica fanout is JSON as well, until a benchmark shows encoding of a 10-hit response above 5ms. Only then do you add a length-prefixed binary frame, in its own commit. Ten small hits are not the latency risk. A slow replica is.
+External HTTP is JSON. Replica fanout is JSON as well, until a benchmark shows encoding of a 10-hit response above 5ms. Only then do you add a length-prefixed binary frame, in its own commit. Ten small hits are not the latency risk. A slow replica is.
+
+### What Spring Boot owns
+
+The writer and both index replicas are the same `@SpringBootApplication`, started with different environment. The coordinator is a second Boot project. Boot opens the port, maps controller methods to the `/v1` routes, and runs request threads as virtual threads. The coordinator forwards the upstream body. Configuration lives in `application.yml` and is overridden by the environment variables named in the guides (`PGHOST`, `PORT`, `AUTH_MODE`, `SEED`, `ROLE`).
+
+Boot does not own the parts this system exists to show:
+
+- The visibility SQL stays a constant in `VisibilitySql`. There is no JPA, no Spring Data repository, and no entity scan. A request borrows a connection from the app-role pool, sets `app.tenant_id`, and runs that SQL inside one transaction.
+- Search responses are not stored in Spring Cache. A token cache is added only in a commit whose profile shows `tokens(query)` on the hot path, and it stores the token list only.
+- The index snapshot is still published by assigning a `volatile` field. A controller calls the query engine. It does not cache the hit list.
+- The Kafka consumer is the Apache Kafka client, started as a `SmartLifecycle` on a platform thread. The offset is committed in that class after the snapshot publish. `@KafkaListener` is not used, because its default ack would hide that order.
+- Hedging stays a class the coordinator controller calls. Boot does not retry a search.
+
+`DataSourceAutoConfiguration` is excluded. Two Hikari pools are declared in one `@Configuration`: `adminDataSource` for migrate and seed (role `aha`), `appDataSource` for requests (role `aha_app`). A third pool created by Boot would connect as the wrong role and skip row-level security.
 
 ### Why the index is hand-built
 
@@ -141,6 +155,8 @@ EWMA uses `alpha = 0.2`. The p95 is a 64-sample ring buffer: copy, sort, take in
 
 ### Processes and ports
 
+These are the ports of the finished system. A row appears in Compose in the phase that starts that process. Phase 1 listens only on 18480 and talks to Postgres on 54329.
+
 | Process | Port |
 | --- | --- |
 | Postgres | 54329 on the host, 5432 in the network |
@@ -166,7 +182,7 @@ feature/phase-4-hedged-slo       -> tag v0.4-slo
 feature/web-search-console       -> tag v0.5-console
 ```
 
-Phase 1 is a correct, slow oracle: load every document the user may read, match tokens in the same `Tokenizer` the index will use, rank with a simple count, return 10. Phase 2 adds postings, BM25, and bitmaps, and you compare a search against the oracle with `curl`. Phase 3 replaces the startup table-scan bootstrap with the log. Phase 4 adds the second replica, hedging, coalescing, fault injection, and a load generator that prints the p99. Phase 5 is the UI.
+Phase 1 is one Spring Boot application. It loads every document the user may read, ranks them with a term count, and returns 10. Upload and grant are separate routes on that same app. Phase 2 adds postings, BM25, and bitmaps inside that same process, and you compare a search with the SQL path using `curl`. Phase 3 teaches that process to follow the Postgres log. Phase 4 is the first time the tree splits: two index replicas and a coordinator, because hedging needs two processes. Phase 5 is the UI.
 
 ## References to read at the start of each phase
 

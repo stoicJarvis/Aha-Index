@@ -15,16 +15,16 @@ The Java Memory Model is part of the design, not an accident. Index publication 
 
 Garbage collection is sized for the latency budget. Generational ZGC on Java 21 keeps stop-the-world pauses well under the 100ms SLO, but a concurrent collector does not forgive an allocating query path: allocation rate still burns CPU and fills the heap. Scoring therefore uses primitive arrays, a reused size-10 heap, and roaring containers instead of `HashSet<Long>`. Virtual threads are used for the phase-1 JDBC oracle and for Kafka polling. The phase-4 scorer stays on a small platform-thread pool. Virtual threads do not speed a CPU-bound intersection, and an unbounded virtual-thread fanout would oversubscribe the same cores the scorer needs.
 
-HTTP at the edge is JSON (Jackson) so the UI and `curl` can read responses. Replica fanout uses length-prefixed binary frames (varint doc ids, raw doubles) so hedge traffic does not pay Jackson’s object graph. Protobuf is the production upgrade once the frame format stops changing; the wire shape is designed to match it.
+HTTP at the edge is JSON so the UI and `curl` can read responses. Replica fanout is JSON as well, until a benchmark shows encoding of a 10-hit response above 5ms. Only then do you add a length-prefixed binary frame, in its own commit.
 
-Processes, not a monolith of frameworks:
+Processes, each one a Spring Boot application except the page:
 
-- `search-oracle` — phase-1 SQL path, kept as a library and a differential oracle.
+- `search-oracle` — phase-1 SQL path, kept as the visibility authority.
 - `search-index` — in-memory inverted index, ACL bitmaps, Kafka applier. Two copies in compose.
 - `search-coordinator` — auth-mode gate, hedging, coalescing, `Server-Timing`.
 - `web` — Next.js UI.
 
-Spring is intentionally absent. A framework would hide the snapshot publication, the hedge timer, and the consumer offset commit that this portfolio exists to show.
+Spring Boot publishes the HTTP API: Tomcat, Jackson, virtual request threads, and the `/v1` controllers. It does not replace the visibility SQL, the volatile snapshot, the hedge timer, or the Kafka offset commit. Those stay classes the controllers call. There is no JPA and no `@KafkaListener`.
 
 ### Inverted index: hand-built, Lucene-shaped
 
@@ -161,9 +161,9 @@ flowchart TD
   gate -->|yes| terms --> vis --> overlay --> score
 ```
 
-### Phase 1 — Naive monolith
+### Phase 1 — One Spring Boot app, brute force
 
-Goal: functional correctness only. One process, one Postgres, synchronous ACL checks.
+Goal: a callable API that is correct and slow. One process, one Gradle project, one Postgres. No index library, no Kafka, no second module.
 
 - Schema and seed: two tenants, users in overlapping groups, documents that contain shared keywords, grants that make the correct top-10 differ per user. Include a document whose body matches every query and that almost nobody can read. That document is the canary for leaks.
 - Search: `ILIKE` on title and body, `EXISTS` allow-grant for the user or their groups, `ORDER BY` a trivial score (term occurrence count) with a hard cap. Post-filter in SQL, not in application memory after an unfiltered `LIMIT 10`. An unfiltered limit is the classic bug: the true top 10 authorized docs sit behind 10 unauthorized hits and disappear.
@@ -181,7 +181,7 @@ Goal: same results as the oracle, without a sequential scan, by intersecting pos
 - Build the in-memory index inside the process from a full Postgres read at startup. Freshness is still “restart to see a grant”. That limitation is explicit and is what phase 3 removes.
 - Implement dictionary, postings, BM25, size-10 heap, live-doc bitmap.
 - Build per-principal roaring bitmaps from `acl_entries` and memberships.
-- Query path pre-filters. Compare the index `curl` hit ids with the oracle `curl` hit ids on the seeded corpus.
+- Query path pre-filters. Compare `GET /v1/search` with `GET /v1/search?engine=sql` on the same port. The doc ids match on the seeded corpus.
 - Add a benchmark main that sweeps selectivity (user can see 50%, 5%, 0.1% of docs) and writes `docs/benchmarks/phase2.md` comparing post-filter candidate counts against pre-filter. The story to tell: post-filter latency tracks the unauthorized corpus; pre-filter tracks the visible corpus.
 - Snapshot publication via `volatile` is introduced here, even with a single writer at startup, so phase 3’s applier has a place to publish.
 
@@ -191,7 +191,7 @@ Exit bar: index and oracle return the same seeded hit ids; the benchmark shows p
 
 Goal: a committed grant or revoke shows up without a restart, and a lagging index refuses to serve rather than leak.
 
-- `deploy/docker-compose.yml`: Postgres 16 with `wal_level=logical`, Kafka KRaft, Debezium Connect, two index replicas, coordinator, web.
+- Postgres gains `wal_level=logical` in this phase. That change recreates the local data volume, which is why phase 1 does not set it early. Kafka KRaft and Debezium Connect are added to Compose beside the existing Postgres. Two replicas, the coordinator, and the web app stay out until phases 4 and 5.
 - Connector config: publication of `documents`, `acl_entries`, `group_memberships`; `provide.transaction.metadata=true`; topic `search.changes`; partition hash is `tenant_id`.
 - Applier: buffer a transaction, apply at END in LSN order, ignore `lsn <= appliedLsn`, publish a new snapshot, then commit the consumer offset.
 - Revoke overlay subtracted on every query.

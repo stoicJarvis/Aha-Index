@@ -1,0 +1,7 @@
+server:
+  address: 127.0.0.1
+  port: ${PORT:18480}
+spring:
+  threads:
+    virtual:
+      enabled: true

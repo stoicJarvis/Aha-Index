@@ -92,82 +92,45 @@ One commit is one behavior change. A mistake in a commit you have already built 
 
 **Significance.** Mixing a schema change and a ranking change in one commit makes a wrong hit list impossible to bisect. The prefixes are the map of that bisect.
 
-## 0.4 Module layout you will grow into
+## 0.4 One application, until a second process exists
 
-**What.** The tree you are aiming at, created across phases:
+**What.** Phase 1 is a single Spring Boot project. Source lives under `src/main/java` and `src/main/resources`. There is no `analysis/`, `api/`, or `oracle/` module. Packages inside that one tree (`io.aha.index.search`, later `io.aha.index.idx`) are how code is grouped.
 
 ```text
 Aha-Index/
-  settings.gradle.kts
-  build.gradle.kts
-  gradle/libs.versions.toml
+  settings.gradle.kts          # root name only, no include(...) until phase 4
+  build.gradle.kts             # the Boot app; versions live here until a second module exists
   gradlew
-  deploy/docker-compose.yml          # Postgres in phase 1; Kafka and Debezium in phase 3
-  deploy/connector.json              # phase 3
-  deploy/register-connector.sh       # phase 3
-  deploy/run-index.sh                # phase 2
-  analysis/                          # Tokenizer. Created in phase 1.
-  api/                               # JSON records. Created in phase 1.
-  oracle/                            # JDBC visibility, naive search, HTTP on 18480.
-  index/                             # phase 2. Replicas on 18481 and 18482.
-  coordinator/                       # phase 4. Public port 18483.
-  loadgen/                           # phase 4. A benchmark main, not a test suite.
-  web/                               # phase 5. Created in that phase.
+  src/main/java/io/aha/index/
+  src/main/resources/
+  deploy/                      # created when that phase needs a container
   docs/
 ```
 
-Java package root: `io.aha.index`.
+A library or a second Boot process is created in the phase that starts it:
 
-Dependencies, and the direction they are allowed to point:
+| When | What gets added | Why it was not created earlier |
+| --- | --- | --- |
+| Phase 2 | RoaringBitmap and index classes in the same app | The brute-force API has to be callable first |
+| Phase 3 | Kafka client, Debezium, `wal_level=logical` | Freshness is the step that reads the log |
+| Phase 4 | Two more processes of the same jar, then a coordinator project, then a load-generator project | Hedging needs two copies. A second Gradle project appears when the program is different |
+| Phase 5 | `web/` | The UI is a view of an API that already meets the SLO |
 
-- `:analysis` depends on nothing of yours.
-- `:api` depends on Jackson only.
-- `:oracle` depends on `:analysis`, `:api`, JDBC.
-- `:index` depends on `:analysis`, `:api`, `:oracle` (for `VisibilityStore` only), RoaringBitmap, Kafka client.
-- `:coordinator` depends on `:api`. It talks to replicas over HTTP. It does not depend on `:index`.
-- `:loadgen` depends on `:api`.
+**Why.** An empty module is a second build file that does not answer a request. Two replicas run the same jar, so the tokenizer stays a class in that jar. The coordinator forwards HTTP and does not import it.
 
-Shared types that two processes need live in `:api`, or in `:oracle` outside the HTTP server package. The index process calls the visibility store. It does not import the oracle’s HTTP server.
-
-Source lives under `src/main/java` and `src/main/resources` only.
-
-**Why.** Three operating-system processes share types and must not share servers. The Gradle graph is the check that the oracle cannot start depending on the index.
-
-**Significance.** A cycle here becomes a single deployable that hides the snapshot publication, the hedge timer, and the offset commit this system exists to make visible.
+**Significance.** Phase 4 is allowed to split the tree. Phase 1 is not. A Gradle `include` added on the first day freezes a process boundary the brute-force search does not have.
 
 ## 0.5 Versions
 
-**What.** Phase 1 commit 1 writes this catalog to `gradle/libs.versions.toml`. If Maven Central has moved a patch and Gradle cannot resolve one of them, change only the patch number and record the substitution in the commit body.
+**What.** Versions for this one application live in `build.gradle.kts`. A `gradle/libs.versions.toml` catalog is created in phase 4, when a second module has to share them. RoaringBitmap, the Kafka client, and JMH are added to the build file in the commit that first calls them. Caffeine is not on that list until a profile shows query tokenization on the hot path. If Maven Central has moved a patch and Gradle cannot resolve one of these, change only the patch number and record the substitution in the commit body.
 
-```toml
-[versions]
-java = "21"
-jackson = "2.21.2"
-postgres = "42.7.4"
-slf4j = "2.0.16"
-logback = "1.5.12"
-roaring = "1.6.29"
-kafka = "4.3.1"
-caffeine = "3.2.0"
-jmh = "1.37"
-hikari = "5.1.0"
-spotless = "6.25.0"
-google-java-format = "1.22.0"
-
-[libraries]
-jackson-databind = { module = "com.fasterxml.jackson.core:jackson-databind", version.ref = "jackson" }
-postgres = { module = "org.postgresql:postgresql", version.ref = "postgres" }
-slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
-logback = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
-roaring = { module = "org.roaringbitmap:RoaringBitmap", version.ref = "roaring" }
-kafka-clients = { module = "org.apache.kafka:kafka-clients", version.ref = "kafka" }
-caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
-jmh-core = { module = "org.openjdk.jmh:jmh-core", version.ref = "jmh" }
-jmh-generator = { module = "org.openjdk.jmh:jmh-generator-annprocess", version.ref = "jmh" }
-hikari = { module = "com.zaxxer:HikariCP", version.ref = "hikari" }
+```kotlin
+id("org.springframework.boot") version "3.5.16"
+id("io.spring.dependency-management") version "1.1.7"
+id("com.diffplug.spotless") version "6.25.0"
 ```
 
-HikariCP is added to the index process in phase 4, when a connection per query shows up in the latency numbers. It is listed now so the catalog is not edited casually later. JMH is a benchmark harness used the same way: one `main`, results pasted into `docs/benchmarks/`. Spotless with `google-java-format` is applied from the first Gradle commit so formatting is one command, `./gradlew spotlessApply`.
+Java toolchain 21. `google-java-format` 1.22.0. Jackson, Logback, SLF4J, HikariCP, and the Postgres JDBC driver come from the Spring Boot plugin. Phase 1 does not pin them and does not list libraries it does not import. Spotless is applied from the first Gradle commit so formatting is one command, `./gradlew spotlessApply`. `spring-boot-starter-jdbc` is added in the Postgres commit, not in the empty health commit.
 
 Docker image tags, used when the phase tells you to:
 
@@ -175,9 +138,9 @@ Docker image tags, used when the phase tells you to:
 - `quay.io/debezium/kafka:3.7.0.Final`
 - `quay.io/debezium/connect:3.7.0.Final`
 
-**Why.** Pinning the catalog in one file is how a multi-module Gradle build stays reproducible. Formatting as a plugin keeps the Java style in the repo instead of in an editor setting.
+**Why.** The plugin block is the list of versions this application uses. A second file that Gradle does not read can drift from the build. Formatting as a plugin keeps the Java style in the repo instead of in an editor setting.
 
-**Significance.** An unpinned Jackson or JDBC driver is a different product on the next clone. The SLO write-up has to name the same binaries.
+**Significance.** The Spring Boot BOM is the pin for the HTTP stack. An extra Jackson version next to that BOM is a different product on the next clone. The SLO write-up has to name the same binaries.
 
 ## 0.6 Code standard
 
@@ -189,7 +152,8 @@ Docker image tags, used when the phase tells you to:
 - JDBC uses `PreparedStatement` and bind variables. SQL text is a constant. User input is never concatenated into SQL.
 - One API write is one transaction: `setAutoCommit(false)`, work, `commit`, and `close` in `finally` (try-with-resources on the connection). A failure rolls back.
 - Each request connection that reads or writes tenant data runs `SELECT set_config('app.tenant_id', ?, true)` before any other statement. `true` makes the setting transaction-local. Migrations, seeding, and the demo directory run as the table owner, which is the role that bypasses row-level security.
-- Logging goes through SLF4J. One info line per request: method, path, status, millis, request id, tenant, user, query length. Document bodies and raw queries stay at debug or out of the log.
+- HTTP is a `@RestController` in the Boot module for that process. `DemoPrincipalFilter` is the only type that reads `X-Tenant-Id` and `X-User-Id`. Errors are one `@RestControllerAdvice` that writes the status table in section 0.11. Request bodies larger than 1 MiB are rejected before the controller runs.
+- Logging goes through SLF4J. One info line per request: method, path, status, millis, request id, tenant, user, query length. Document bodies and raw queries stay at debug or out of the log. Use Boot’s logging configuration in `application.yml`. A hand-written `logback.xml` is not added.
 - Time is `timestamptz` in Postgres and `long` epoch millis in Java. The clock interface is `io.aha.index.time.SystemClock` with `long millis()`. Production binds `System::currentTimeMillis`. The freshness comparison reads that interface so a deployment can set `FRESHNESS_SLO_MS` without editing the comparison.
 - Null is rejected at the boundary with `Objects.requireNonNull`. Public methods document the empty-input behavior in Javadoc when empty is meaningful (the tokenizer).
 - Format with Spotless (`google-java-format`) before the commit.
@@ -573,7 +537,7 @@ The response fields from phase 1 stay stable. Later phases add fields at the end
 
 - A search response key includes tenant and user.
 - A search response cached past an ACL write includes `aclEpoch` in the key.
-- Caffeine, added in phase 4, stores `tokens(queryString)` and nothing else.
+- A token cache, if a later profile adds one, stores `tokens(queryString)` and nothing else.
 
 **Why.** A cache key without the principal serves one user’s hits to another. A token cache has no documents and no grants in it, so its lifetime is independent of the ACL log.
 
@@ -596,6 +560,6 @@ You are done with this step when all of the following are true:
 - `java -version` reports 21, `docker compose version` runs, and `git --version` runs.
 - The git history on `main` starts with the workbook commit (or already contains these docs).
 - You can point at section 0.7 and say the phase-1 migration will be that script.
-- No Gradle file, Java file, or `web/` directory exists yet.
+- The only code that may exist is the phase-1 health application: one Spring Boot project, no `web/` directory, no second Gradle module.
 
 Next file: [01-phase-1-naive-oracle.md](01-phase-1-naive-oracle.md). Tick the setup lines in [../CHECKLIST.md](../CHECKLIST.md) as you finish them.

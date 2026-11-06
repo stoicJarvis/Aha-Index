@@ -11,84 +11,21 @@ git checkout main
 git checkout -b feature/phase-2-bitmap-prefilter
 ```
 
-This phase has no test sources. Where a check names expected ids or a score, confirm it with `curl` or `psql` against Compose. `./gradlew :index:compileJava` is the compile check.
+This phase stays one Spring Boot application, on port 18480. There is still no `index/` Gradle module and no second port. The index is a package, `io.aha.index.idx`, inside the app from phase 1. RoaringBitmap is added to `build.gradle.kts` in the commit that first imports it.
 
-Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
+This phase has no test sources. Where a check names expected ids or a score, confirm it with `curl` or `psql` against Compose. `./gradlew compileJava` is the compile check.
 
-Phase 2 loads the index from Postgres at startup. A grant committed after startup is invisible to the bitmap until restart. The Postgres candidate check from `DocumentStore.retainVisible` still drops a revoke immediately, because it reads current rows. New grants wait for phase 3. Say that in the module's package javadoc so you do not "fix" it with a cache invalidator.
+Every commit opens with what it changes and why that change waits until this phase.
 
-Add to `settings.gradle.kts`:
+Phase 2 loads the index from Postgres at startup. A grant committed after startup is invisible to the bitmap until restart. The Postgres candidate check from `DocumentStore.retainVisible` still drops a revoke immediately, because it reads current rows. New grants wait for phase 3. Say that on the package so a cache invalidator is not added to hide it.
 
-```kotlin
-include("index")
-```
+The search route keeps the phase-1 SQL implementation available. Indexed search is what `GET /v1/search` returns once this phase is done, and the SQL path remains the check you curl against.
 
-## Commit 1 — `chore: add the index module`
-
-**What.** A new Gradle module `:index` with its own `main`, depending on analysis, api, the oracle's visibility store, and RoaringBitmap. It prints a boot line and exits.
-
-**Why.** The index is a separate process from the oracle. It may call `VisibilityStore`. The oracle must not depend on the index. Creating the module before the data structures keeps that arrow in one direction.
-
-**Significance.** Phase 3's consumer and phase 4's two replicas are this same process, started twice. A search path that grew inside the oracle would have to be cut apart under a live SLO.
-
-`index/build.gradle.kts`:
-
-```kotlin
-plugins {
-    java
-    application
-}
-
-application {
-    mainClass.set("io.aha.index.idx.IndexMain")
-}
-
-dependencies {
-    implementation(project(":analysis"))
-    implementation(project(":api"))
-    implementation(project(":oracle"))
-    implementation(libs.roaring)
-    implementation(libs.slf4j.api)
-    implementation(libs.logback)
-    implementation(libs.jackson.databind)
-}
-```
-
-Package is `io.aha.index.idx` because `io.aha.index.index` is an unreadable stutter. The module directory stays `index/`.
-
-`IndexMain` prints `index module booted` and exits 0. You will replace the body in the HTTP commit.
-
-ZGC lives in `deploy/run-index.sh`, not in the Gradle application plugin:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-export PORT="${PORT:-18481}"
-export BOOTSTRAP="${BOOTSTRAP:-jdbc}"
-exec java -XX:+UseZGC -XX:+ZGenerational -Xms512m -Xmx512m \
-  -jar index/build/libs/index-0.1.0-SNAPSHOT.jar
-```
-
-The jar name follows the application plugin only if you build a fat jar. `installDist` is easier and matches phase 1. Use `./gradlew :index:installDist` and point the script at `index/build/install/index/bin/index`. Pass JVM flags with `JAVA_OPTS`.
-
-Commit:
-
-```text
-chore: add the index module
-
-Why:
-The index is a separate process from the oracle. It may depend on
-the oracle's VisibilityStore. The oracle must not depend on the index.
-
-Verify:
-./gradlew :index:compileJava
-```
-
-## Commit 2 — `feat: assign dense doc ids and store document records`
+## Commit 1 — `feat: assign dense doc ids and store document records`
 
 **What.** `DocTable` assigns a dense `int` the first time it sees an external id, in call order, and stores title, body length, and token count under that int.
 
-**Why.** Roaring bitmaps and postings want 32-bit keys. A `HashSet` of UUID strings dominates both memory and intersection time. The loader in commit 8 calls this in external-id order, so the dense id follows `docId` ascending and the tie-break stays stable.
+**Why.** The next commit stores postings by document id. A `HashSet` of strings is the wrong key for that. This commit only assigns the ids. RoaringBitmap is not a dependency yet, nothing new listens on a port, and the application class does not change. Package `io.aha.index.idx` exists because this class needs a home. `io.aha.index.index` would stutter. The loader in the Postgres commit calls `assign` in external-id order, so the dense id follows `docId` ascending.
 
 **Significance.** Every bitmap, posting, and score in the rest of the index is an int from this table. Reassigning ids on restart, or recycling an id after a delete, makes a revoke land on the wrong document.
 
@@ -114,16 +51,16 @@ Roaring bitmaps key on 32-bit integers. External ids stay strings
 at the HTTP boundary and become dense ints once, in this table.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 3 — `feat: build sorted postings lists`
+## Commit 2 — `feat: build sorted postings lists`
 
 **What.** For each term, a sorted array of dense doc ids plus a parallel array of term frequencies. A cursor walks that array with `next` and galloping `advanceTo`.
 
 **Why.** Conjunction is an intersection of sorted lists, rarest term first. Galloping finds the next candidate without scanning every id when one list is much longer than the other. The frequency sits beside the id so scoring does not rescan the body.
 
-**Significance.** Commit 7 intersects these lists with the visibility bitmap. A posting list that is unsorted, or whose frequency array has a different length, returns the wrong document or the right document with a silent score.
+**Significance.** Commit 6 intersects these lists with the visibility bitmap. A posting list that is unsorted, or whose frequency array has a different length, returns the wrong document or the right document with a silent score.
 
 `io.aha.index.idx.Postings`
 
@@ -146,10 +83,10 @@ doc-id sequence. Galloping advanceTo is the primitive the query
 walk uses when one list is much shorter than the other.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 4 — `feat: score with BM25 into a fixed top-10 heap`
+## Commit 3 — `feat: score with BM25 into a fixed top-10 heap`
 
 **What.** BM25 with `k1 = 1.2` and `b = 0.75`, and a heap that keeps ten `(docId, score)` pairs. Tie-break is the dense id ascending.
 
@@ -203,14 +140,18 @@ the SLO demo shows. BM25 is deterministic here: fixed k1 and b,
 doc-id tie break, and an idf that stays positive when a term is common.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 5 — `feat: publish index snapshots through a volatile field`
+## Commit 4 — `feat: publish index snapshots through a volatile field`
 
 **What.** An immutable `IndexSnapshot`, and a publisher that stores it in a `volatile` field. Readers load that field. The writer mutates only a builder that has not been published.
 
-**Why.** Publication is single-writer, many-readers. A reader that loads the volatile field happens-before every write the builder finished before the store. Roaring bitmaps are not safe to mutate while another thread reads them, so the snapshot clones bitmaps before it becomes visible.
+**Why.** Publication is single-writer, many-readers. A reader that loads the volatile field happens-before every write the builder finished before the store. Roaring bitmaps are not safe to mutate while another thread reads them, so the snapshot clones bitmaps before it becomes visible. This is the first commit that imports RoaringBitmap, so the dependency is added here:
+
+```kotlin
+implementation("org.roaringbitmap:RoaringBitmap:1.6.29")
+```
 
 **Significance.** Phase 3's applier has nowhere to publish a new generation except this field. If query threads take a lock, or if a published bitmap is still being `or`-ed, the freshness path and the latency path fight over the same object.
 
@@ -223,9 +164,9 @@ Verify:
 - `Map<String, RoaringBitmap> groupGrants`
 - `Map<String, int[]> memberships` — user id to group ids, arrays not shared with the builder
 - `double avgdl`
-- `long appliedLsn` — 0 in this phase
-- `long appliedAtMillis` — 0 in this phase
 - `boolean ready`
+
+`appliedLsn` and `appliedAtMillis` are added in phase 3, when a log event has an LSN to store. This phase has no log.
 
 `SnapshotPublisher`:
 
@@ -254,16 +195,16 @@ one, never a bitmap mid-or. Volatile publication is the protocol.
 RoaringBitmap writes stay on the builder side of publish.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 6 — `feat: encode allow-grants as roaring bitmaps`
+## Commit 5 — `feat: encode allow-grants as roaring bitmaps`
 
 **What.** Per tenant, a user bitmap, a group bitmap, a small membership array, and a live-doc bitmap. The visible set is a clone of the user bitmap, OR-ed with each group bitmap, AND-ed with live docs.
 
 **Why.** Enterprise ACLs are sparse: many documents, fewer groups, users who inherit through groups. Roaring keeps sparse sets in arrays and dense sets in bitsets, and the intersection never materializes a Java `Integer` per document. The clone matters: an in-place OR into the published user bitmap permanently grants that user every document in the group.
 
-**Significance.** This is the acceleration structure, not the authority. It can lag a revoke by seconds. Commit 8's Postgres confirm exists because a bitmap-only answer would bring that lag back as a leak.
+**Significance.** This is the acceleration structure, not the authority. It can lag a revoke by seconds. Commit 7's Postgres confirm exists because a bitmap-only answer would bring that lag back as a leak.
 
 Builder `io.aha.index.idx.IndexBuilder`:
 
@@ -271,7 +212,7 @@ Builder `io.aha.index.idx.IndexBuilder`:
 - `grantUser(externalDocId, userId)`, `grantGroup(externalDocId, groupId)`.
 - `addMembership(userId, groupId)`.
 - `deleteDocument(externalDocId)` removes the id from `liveDocs`, from every posting term it contributed (you stored the token list on the doc record), and from every grant bitmap that contains it. Track `Map<Integer, List<Principal>> grantsByDoc` so delete does not scan every bitmap. A second delete is a no-op.
-- `IndexSnapshot build(long appliedLsn, long appliedAtMillis, boolean ready)` computes `avgdl` from live docs, wraps maps in `Map.copyOf`, clones every bitmap (`bitmap.clone()`), clones membership arrays, and returns a snapshot the builder may continue to modify afterwards without the snapshot changing. Grant a user on the builder after `build()`. The published snapshot's bitmap does not contain the new doc.
+- `IndexSnapshot build(boolean ready)` computes `avgdl` from live docs, wraps maps in `Map.copyOf`, clones every bitmap (`bitmap.clone()`), clones membership arrays, and returns a snapshot the builder may continue to modify afterwards without the snapshot changing. Grant a user on the builder after `build()`. The published snapshot's bitmap does not contain the new doc.
 
 `Visibility` helper, pure function of a snapshot:
 
@@ -287,7 +228,7 @@ public static RoaringBitmap visible(IndexSnapshot snap, String userId) {
 }
 ```
 
-Store memberships as `Map<String, String[]>` of group id strings, not ints. The group grant map is keyed by group id string. Correct the field list in commit 5 if you already used `int[]`. The snapshot field is `Map<String, String[]> memberships`.
+Store memberships as `Map<String, String[]>` of group id strings, not ints. The group grant map is keyed by group id string. Correct the field list in commit 4 if you already used `int[]`. The snapshot field is `Map<String, String[]> memberships`.
 
 ```java
 RoaringBitmap out = new RoaringBitmap();
@@ -315,16 +256,16 @@ on publish and OR-ing into a fresh bitmap are what keep a query
 from permanently granting the user every document in their groups.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 7 — `feat: intersect postings with the visibility bitmap before scoring`
+## Commit 6 — `feat: intersect postings with the visibility bitmap before scoring`
 
 **What.** Order query terms by document frequency, rarest first. Intersect postings. Intersect the survivor set with the visibility bitmap as soon as that bitmap is more selective than the next term. Score survivors into the size-10 heap.
 
 **Why.** Phase 1 filtered after collecting matches, so cost tracked the whole corpus. Pre-filter cost tracks the documents the user can read. Scoring a hundred hits and keeping one is the bug this commit removes, and the scored-document count is how you see that it happened.
 
-**Significance.** The phase-2 benchmark's story is this order of operations. A post-filter that looks correct on Ada's three documents still falls over when the unauthorized corpus grows, which is the case commit 10 measures.
+**Significance.** The phase-2 benchmark's story is this order of operations. A post-filter that looks correct on Ada's three documents still falls over when the unauthorized corpus grows, which is the case commit 9 measures.
 
 `io.aha.index.idx.QueryEngine.search(IndexSnapshot snap, String userId, String query)`:
 
@@ -370,7 +311,7 @@ for docId in rarest:
 
 Do not reset other cursors inside the loop.
 
-BM25 `tf` is the term frequency stored at index time. You need it. A postings entry is not only a doc id. Change `Postings` in this commit (or a fixup commit if commit 3 is already too far to amend) so each term maps to parallel `int[] docIds` and `int[] tfs`, same length, same order. `add` takes `(term, docId, tf)`. `remove` removes both. `DocTable` already has the token list; the loader passes `termFreq`.
+BM25 `tf` is the term frequency stored at index time. You need it. A postings entry is not only a doc id. Change `Postings` in this commit (or a fixup commit if commit 2 is already too far to amend) so each term maps to parallel `int[] docIds` and `int[] tfs`, same length, same order. `add` takes `(term, docId, tf)`. `remove` removes both. `DocTable` already has the token list; the loader passes `termFreq`.
 
 If you notice this only now, that is what this commit is for. Update postings and `Bm25` to read `tf` from the posting, not from a rescan of the body. Rescanning the body is correct and slower. Do the parallel array. A comment in `Postings` should say the two arrays stay the same length.
 
@@ -402,10 +343,10 @@ intersection happens before BM25, and the scored-doc counter locks
 that order.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 8 — `feat: load a snapshot from Postgres and confirm candidates`
+## Commit 7 — `feat: load a snapshot from Postgres and confirm candidates`
 
 **What.** At startup, one repeatable-read transaction loads documents, grants, and memberships into a snapshot per tenant. After BM25, `retainVisible` confirms candidate ids in batches of 30, at most five batches. A SQLException becomes 503, and the unconfirmed list is not returned.
 
@@ -416,10 +357,10 @@ Verify:
 `io.aha.index.idx.JdbcBootstrap`:
 
 1. Open a connection, `setAutoCommit(false)`, `setTransactionIsolation(REPEATABLE_READ)`.
-2. Read documents `ORDER BY tenant_id, doc_id`. You are building one snapshot that contains every tenant. Namespace the external key as `tenantId + "\u0000" + docId` inside `DocTable`, or build `Map<String, IndexSnapshot>` keyed by tenant. Prefer **one `IndexBuilder` per tenant** stored in `Map<String, IndexBuilder>`, and a published `Map<String, IndexSnapshot>`. Change `SnapshotPublisher` to hold `volatile Map<String, IndexSnapshot>` or a small `CorpusSnapshot` that contains the map. Do this now, before the HTTP handler, even if it means adjusting commit 5's type. A single global bitmap with colliding doc ids across tenants is a cross-tenant leak.
+2. Read documents `ORDER BY tenant_id, doc_id`. You are building one snapshot that contains every tenant. Namespace the external key as `tenantId + "\u0000" + docId` inside `DocTable`, or build `Map<String, IndexSnapshot>` keyed by tenant. Prefer **one `IndexBuilder` per tenant** stored in `Map<String, IndexBuilder>`, and a published `Map<String, IndexSnapshot>`. Change `SnapshotPublisher` to hold `volatile Map<String, IndexSnapshot>` or a small `CorpusSnapshot` that contains the map. Do this now, before the HTTP handler, even if it means adjusting commit 4's type. A single global bitmap with colliding doc ids across tenants is a cross-tenant leak.
 3. Read `acl_entries` and `group_memberships` in the same transaction.
 4. Commit the JDBC transaction.
-5. `publish` with `ready=true`, `appliedLsn=0`.
+5. `publish` with `ready=true`.
 
 `QueryEngine` gains `Connection confirmConn` and after `TopK` collects a ranked candidate list of up to 30 external ids per batch:
 
@@ -451,45 +392,37 @@ disappear immediately. A grant still waits for a reload. The class
 Javadoc records that limitation so phase 3 has something to remove.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 9 — `feat: serve the index on port 18481`
+## Commit 8 — `feat: serve indexed search from the same application`
 
-**What.** A read-only HTTP server. Search and health use the same JSON as the oracle, with `mode=indexed`. Writes stay on the oracle port. Startup assumes the schema and the seed already exist and bootstraps with `BOOTSTRAP=jdbc`.
+**What.** `GET /v1/search` on port 18480 now answers from the snapshot and returns `mode=indexed`. `GET /v1/search?engine=sql` still runs the phase-1 scan, so you can compare the two hit lists on one process. Writes stay on the same routes they already have. Startup bootstraps the snapshot from JDBC after the existing migration runner.
 
-**Why.** The process boundary is real from here on. The oracle remains the writer and the visibility authority on 18480. The index serves reads from the snapshot. One search handler also covers `/internal/search`, so the coordinator in phase 4 does not grow a second parser.
+**Why.** A second port would be a second process, and nothing in this phase needs one. The comparison you want is two engines, not two listeners. A route that only a future coordinator would call is not added here. Phase 4's coordinator calls this same `GET /v1/search`.
 
-**Significance.** Two ports mean you can curl the same query at both and compare ids. A write route added on the index would create a second source of truth next to Postgres.
+**Significance.** `engine=sql` is the check that the index did not change who is visible. Removing it to "simplify" the controller removes the only way to see a wrong bitmap without a second app.
 
-`IndexServer` mirrors `OracleServer` routes that are reads:
+- `GET /v1/health` adds `ready`. Lag and LSN arrive with the log in phase 3.
+- `GET /v1/search` returns `mode=indexed`. `replica` stays `oracle`, the one process. `index-a` and `index-b` are names for the two processes phase 4 starts.
+- `GET /v1/search?engine=sql` is the phase-1 path.
 
-- `GET /v1/health` returns `mode=indexed`, `ready`, `appliedLsn`, `lagMs`. In this phase `appliedLsn` is 0 and `lagMs` is 0 when ready.
-- `GET /v1/search` same JSON as the oracle with `mode=indexed` and `replica` from env `REPLICA_ID` default `index-a`.
-- `GET /internal/search` is the same handler. The coordinator will use it in phase 4. Keeping one handler avoids a second parser.
-- No write routes on this process. ACL writes stay on the oracle port until the coordinator exists. Document that in the class javadoc.
-
-Startup: migrate is not this process's job. It assumes the schema and the seed already exist. `BOOTSTRAP=jdbc` runs `JdbcBootstrap`. Any other value logs an error and exits 2 in this phase. Phase 3 adds `log`.
-
-Start the index on port 18481 against Compose and repeat the Ada / Ivan canary curls from phase 1.
-
-`deploy/run-index.sh` uses `PORT=18481` and `BOOTSTRAP=jdbc`.
+Repeat the Ada and Ivan curls from phase 1 against `127.0.0.1:18480`. Then repeat them with `engine=sql` and confirm the doc ids match.
 
 Commit:
 
 ```text
-feat: serve the index on port 18481
+feat: serve indexed search from the same application
 
 Why:
-The process boundary is real from this phase on. The oracle remains
-on 18480 as the writer and the differential oracle. The index serves
-reads from the snapshot.
+The comparison is two engines on the port you already have.
+A second process waits until phase 4 needs two copies.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
-## Commit 10 — `docs: record post-filter cost against pre-filter cost`
+## Commit 9 — `docs: record post-filter cost against pre-filter cost`
 
 **What.** `SelectivityBenchmark` times a user who can read 0.1% of 20,000 documents against a user who can read all of them, and writes `docs/benchmarks/phase2.md`. Confirm is off for this measurement and on in the server. A post-filter that lives only in the benchmark scores the global top and then drops unauthorized hits.
 

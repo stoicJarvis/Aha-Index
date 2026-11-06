@@ -15,7 +15,7 @@ git checkout -b feature/web-search-console
 
 ## Commit 1 — `chore: scaffold the Next.js console`
 
-**What.** A Next.js app in `web/`, TypeScript, Tailwind, and the shadcn primitives the later commits use. No search behavior yet. Node arrives in this phase.
+**What.** A Next.js app in `web/`, TypeScript and Tailwind. No shadcn components yet, and no search behavior. Node arrives in this phase. A component is installed in the commit that renders it.
 
 **Why.** The console is a harness and a latency instrument. It waits until `v0.4-slo` so the UI is built against a backend that already meets the bound, and so earlier phases stay Java, Postgres, Kafka, and Debezium.
 
@@ -39,19 +39,9 @@ npx create-next-app@latest web \
 
 If the installed `create-next-app` rejects `--turbopack` or `--no-src-dir`, drop the rejected flag and rerun. Keep the app router at `web/app`. If the scaffolder offers a test runner, skip it, and delete any generated `*.test.*` or `__tests__` directory before the commit. This console has no test suite.
 
-Then:
+Add `"dev": "next dev --port 43123"` in `web/package.json` scripts if the scaffold does not already bind a port. The console always uses port **43123**. shadcn is initialized in the next commit, when the switcher is the first component that needs it.
 
-```bash
-cd web
-npx shadcn@latest init
-npx shadcn@latest add button input card badge sheet select label
-```
-
-`init` will ask questions. Answers: TypeScript already set, style `new-york` if offered, base color `neutral`, CSS variables yes, no RSC-incompatible experiments. If a prompt has no bearing on this list, accept the default.
-
-Add `"dev": "next dev --port 43123"` in `web/package.json` scripts if the scaffold does not already bind a port. The console always uses port **43123**.
-
-`.gitignore` at the repo root already ignores `web/node_modules/` and `web/.next/`. Confirm `web/.gitignore` also ignores those. Do not commit `node_modules`.
+Add `web/node_modules/` and `web/.next/` to the root `.gitignore` in this commit. Confirm `web/.gitignore` also ignores those. Do not commit `node_modules`.
 
 `web/README.md` is five lines: what the console is, `npm install`, `npm run dev`, the URL `http://127.0.0.1:43123`, and the sentence "The coordinator must already be on port 18483."
 
@@ -79,12 +69,14 @@ cd web && npm run build
 
 The coordinator in demo mode trusts `X-Tenant-Id` and `X-User-Id`. The switcher is the only place the browser sets them.
 
+Initialize shadcn in `web/` and add `select`, `badge`, and `label`. Those are the controls this commit renders. `init` answers: TypeScript already set, style `new-york` if offered, base color `neutral`, CSS variables yes. There is no search cache and no abort helper yet. Changing the principal clears the on-screen list. The next commit fetches, aborts, and caches.
+
 `web/lib/principal.ts`:
 
 - `Principal = { tenantId: string; userId: string }`
 - `loadPrincipal()` reads `sessionStorage` key `aha.principal`. Returns null when absent or malformed.
 - `savePrincipal(p)` writes it.
-- `clearResultsCache()` is a callback the search module registers. The switcher calls it. Do not import the cache into this file and the switcher into the cache in a cycle. Put the cache in `web/lib/search-cache.ts` and call `searchCache.clear()` from the switcher.
+- The select handler clears the hit list in page state. The search cache does not exist yet.
 
 `web/lib/api.ts`:
 
@@ -100,7 +92,7 @@ export function principalHeaders(p: Principal): Headers {
 }
 ```
 
-`GET ${COORDINATOR}/v1/directory` fills the two shadcn `Select`s. Tenant first. When the tenant changes, the user select resets to the first user of that tenant, the cache clears, and any in-flight search is aborted (the abort registry comes in the next commit; call the function even if it is a no-op stub exported from `web/lib/inflight.ts` as `abortInflight()`).
+`GET ${COORDINATOR}/v1/directory` fills the two shadcn `Select`s. Tenant first. When the tenant changes, the user select resets to the first user of that tenant and the hit list clears. Nothing is in flight yet, so there is nothing to abort.
 
 Users shown are only the directory entries for the selected tenant. The client does not invent user ids.
 
@@ -108,11 +100,13 @@ On first load with an empty session, select `acme` / `ada` if the directory cont
 
 The page header shows the display name and the tenant id in a `Badge`. Changing the user clears the hit list immediately, before the next search returns. A slow response for Ada must not paint after you have switched to Ivan. That is the next commit's job; in this commit, clear the list synchronously inside the select handler so a late response has nowhere correct to land once the abort exists.
 
-CORS: the browser calls the coordinator directly. Add to the coordinator, in this same commit (this is a backend edit on the frontend branch, and that is allowed because the browser cannot function without it):
+CORS: the browser calls the coordinator directly. Add a `WebMvcConfigurer` on the coordinator, in this same commit (this is a backend edit on the frontend branch, and that is allowed because the browser cannot function without it):
 
-- On every response, if `Origin` is `http://127.0.0.1:43123` or `http://localhost:43123`, set `Access-Control-Allow-Origin` to that origin, `Access-Control-Allow-Headers` to `Content-Type, X-Tenant-Id, X-User-Id, X-Request-Id`, `Access-Control-Allow-Methods` to `GET, POST, OPTIONS`, `Access-Control-Expose-Headers` to `Server-Timing, X-Replica, X-Hedged`.
-- `OPTIONS` returns 204.
-- Any other origin gets no CORS headers.
+- `allowedOrigins` is `http://127.0.0.1:43123` and `http://localhost:43123`.
+- `allowedHeaders` is `Content-Type`, `X-Tenant-Id`, `X-User-Id`, `X-Request-Id`.
+- `allowedMethods` is `GET`, `POST`, `OPTIONS`.
+- `exposedHeaders` is `Server-Timing`, `X-Replica`, `X-Hedged`.
+- Any other origin receives no `Access-Control-Allow-Origin` header.
 
 `curl -D -` an allowed origin and a second origin. The allowed origin receives `Access-Control-Allow-Origin`. The other origin receives no allow-origin header.
 
@@ -123,8 +117,8 @@ feat: add a principal switcher that sends demo headers
 
 Why:
 Demo mode is a harness. The switcher is the only UI that sets the
-two headers, the cache clears on change, and the coordinator only
-emits CORS for the console's origin.
+two headers. Changing principal clears the list on screen.
+The coordinator emits CORS because this is the first browser call.
 
 Verify:
 curl -sD - -o /dev/null -H 'Origin: http://127.0.0.1:43123' -X OPTIONS http://127.0.0.1:18483/v1/search
@@ -142,9 +136,9 @@ Manual check, written into the commit body under `Verify:` as well: load the pag
 
 **Significance.** This is the client half of the isolation the server already enforces. A cache key without tenant and user, or a 503 replaced by a cached hit list, is the client-side version of serving a stale allow-set.
 
-`web/app/page.tsx` is the console. One column on a narrow viewport. On `min-width: 768px`, the result list and the telemetry card (empty for now) sit in a two-column grid.
+`web/app/page.tsx` is the console, one column. The telemetry card is the next commit. Add the shadcn `Input` in this commit.
 
-Search box: shadcn `Input`. The typed value updates on every keystroke. Do not debounce the controlled value. Debounce a copy:
+Search box: the typed value updates on every keystroke. Do not debounce the controlled value. Debounce a copy:
 
 ```ts
 const [raw, setRaw] = useState("");
@@ -265,7 +259,7 @@ export function parseServerTiming(header: string | null): Record<string, number>
 
 The fetch path records `const t0 = performance.now()` before `fetch` and `const rtt = performance.now() - t0` after the body is parsed. `serverMs` is the `coord` duration from `Server-Timing`. `networkMs` is `Math.max(0, rtt - serverMs)` when `coord` is present, else `rtt`.
 
-`web/components/telemetry-card.tsx` is a shadcn `Card`, pinned to the right column on desktop and stacked under the results below 768px. It shows, for the current principal only:
+Add the shadcn `Card` in this commit. `web/components/telemetry-card.tsx` is that card, pinned to a second column on `min-width: 768px` and stacked under the results below that. It shows, for the current principal only:
 
 - Last query: server ms, network ms, replica (`X-Replica`), hedged (`X-Hedged`), lag (`lag` metric).
 - A 100ms mark. The last server sample uses a green text class at or under 100 and an amber class above. Use Tailwind classes, not inline hex, so dark mode stays readable. Compare against `serverMs`, never against `rtt`.
@@ -300,7 +294,7 @@ Manual: with `index-a` delayed 400ms and `index-b` healthy, search as Ada. The c
 
 **Significance.** The freshness sentence of the spec is something a person can watch. The probe uses its own abort controller and stops if the principal changes mid-wait, so Ivan's revoke probe cannot update Ada's results.
 
-A shadcn `Sheet` titled "Permissions", triggered by a `Button` "Edit access".
+Add the shadcn `Sheet` and `Button` in this commit. The sheet is titled "Permissions" and the button says "Edit access".
 
 Fields:
 
@@ -350,7 +344,7 @@ manual grant and revoke of d-canary as Ivan, seed restored
 
 **Significance.** This is the "one replica is slow" sentence, visible. A toggle that only changes a label, without the fault call, demonstrates nothing about hedging.
 
-A switch "Delay index-a by 400ms". It `POST`s `/admin/faults/replica` through the coordinator. Turning it off posts `delayMs: 0`.
+Add the shadcn `Switch` in this commit. The label is "Delay index-a by 400ms". It `POST`s `/admin/faults/replica` through the coordinator. Turning it off posts `delayMs: 0`.
 
 If the coordinator returns 404, the card shows "Fault injection is off. Start the coordinator with FAULTS_ENABLED=true." The switch does not pretend it worked.
 

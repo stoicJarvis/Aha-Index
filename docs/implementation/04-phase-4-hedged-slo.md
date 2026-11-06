@@ -9,32 +9,35 @@ git checkout main
 git checkout -b feature/phase-4-hedged-slo
 ```
 
-Phase 3's index is correct and fresh. One replica that stalls still stalls the caller. This phase puts two replicas behind a coordinator that hedges, coalesces, and ejects a slow primary. The browser still does not exist. The SLO is the load-generator main. This phase has no test sources.
+Phase 3's index is correct and fresh, inside one process. One stalled search still stalls the caller, and hedging needs a second copy. This phase starts that second copy from the same jar. A new Gradle project appears only when the program is different: the coordinator, in the commit that proxies, and the load generator, in the commit that measures. The tokenizer, the visibility SQL, and the index classes stay in the jar both replicas run. The browser still does not exist. This phase has no test sources.
 
 Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
 
 ## Commit 1 — `feat: run a second index replica in its own consumer group`
 
-**What.** Two index services, `index-a` and `index-b`, each with its own consumer group, replica id, and host port. Both use `BOOTSTRAP=log`.
+**What.** The same Boot jar, started three times. One process keeps the write routes on port 18480 and does not consume the log (`ROLE=writer`). Two processes consume the log, `index-a` on 18481 and `index-b` on 18482, each with its own consumer group. There is no new Gradle module.
 
-**Why.** Hedging needs two complete copies. A shared consumer group with one partition delivers the log to only one of them, and the other sits empty. Every hedge would then hit a replica with no documents.
+**Why.** Hedging needs two complete copies. A shared consumer group with one partition delivers the log to only one of them, and the other sits empty. The copies are the same program with different environment, so a second source tree would only duplicate the classes phase 3 already runs. ZGC is set here, on the two long-running index JVMs, because this is the phase that measures pauses. The writer stays on 18480 so grants still have one place to land.
 
-**Significance.** The coordinator in the rest of this phase assumes both ports answer the same Ada query. A group id copied from one service to the other looks healthy in Compose and fails the moment the backup is used.
+**Significance.** The coordinator in the rest of this phase assumes both index ports answer the same Ada query. A group id copied from one service to the other looks healthy in Compose and fails the moment the backup is used.
 
-Compose gains two services, `index-a` and `index-b`. They share the image you build locally. The least painful path: a `deploy/Dockerfile.index` that is `eclipse-temurin:21-jre` plus the `installDist` output copied in. Build it with `docker compose build` after `./gradlew :index:installDist`.
+`deploy/Dockerfile.index` packages the jar `./gradlew bootJar` already produces:
 
 ```dockerfile
 FROM eclipse-temurin:21-jre
-COPY index/build/install/index /opt/index
-ENTRYPOINT ["/opt/index/bin/index"]
+COPY build/libs/aha-index-0.1.0-SNAPSHOT.jar /opt/index.jar
+ENTRYPOINT ["java", "-jar", "/opt/index.jar"]
 ```
 
-Both services:
+The writer stays a host process: `ROLE=writer`, `BOOTSTRAP=jdbc`, port 18480. It serves `POST /v1/documents`, `POST /v1/acl`, and `POST /v1/memberships`. It does not start `LogConsumer`.
 
+Both index services:
+
+- `ROLE=index`
 - `BOOTSTRAP=log`
 - `KAFKA_BOOTSTRAP=kafka:9092`
 - `PGHOST=postgres`, `PGPORT=5432`, same user and database
-- `JAVA_OPTS=-XX:+UseZGC -XX:+ZGenerational -Xms512m -Xmx512m`
+- `JAVA_TOOL_OPTIONS=-XX:+UseZGC -XX:+ZGenerational -Xms512m -Xmx512m`
 
 They differ:
 
@@ -43,7 +46,7 @@ They differ:
 | index-a | index-a | index-replica-a | 18481 |
 | index-b | index-b | index-replica-b | 18482 |
 
-Same group id would assign the single partition to one of them. The other would sit idle and every hedge would hit an empty replica. A comment in the compose file states that the two `CONSUMER_GROUP` values differ.
+Same group id would assign the single partition to one of them. The other would sit idle and every hedge would hit an empty replica. A comment in the compose file states that the two `CONSUMER_GROUP` values differ. `GET /v1/search` on an index process returns `replica` from `REPLICA_ID`. The writer is no longer the search path.
 
 Bring both up. `deploy/freshness.sh` still targets `index-a`. Hit `index-b` with the same curl and expect the same Ada ids.
 
@@ -63,21 +66,21 @@ both health endpoints ready=true and the same Ada search ids
 
 ## Commit 2 — `chore: add the coordinator module`
 
-**What.** A new process on port 18483 that proxies search to `index-a` and proxies writes to the oracle. One attempt. No hedge yet. It depends on `:api` only.
+**What.** A new Gradle project, `:coordinator`, on port 18483. It proxies search to `index-a` and proxies writes to the writer on 18480. One attempt. No hedge yet. `gradle/libs.versions.toml` is created in this commit so the two Boot builds share the Spring Boot version.
 
-**Why.** Clients need one address, and that address must not be an index replica. Introducing the process as a straight proxy makes the hedge commit a behavior change on its own. Writes go to Postgres through the oracle and are not retried, because a hedged grant would race the row that is the source of truth.
+**Why.** Clients need one address, and that address must not be an index replica. The coordinator is a different program, which is why it is a second project. It forwards the response body, so it does not need the index's classes, a shared JSON jar, or the tokenizer. Introducing it as a straight proxy makes the hedge commit a behavior change on its own. Writes go to the writer and are not retried, because a hedged grant would race the row that is the source of truth. The load generator is not created here. It arrives in the commit that runs it.
 
-**Significance.** The browser in phase 5 talks only to this port. A coordinator that imports the index module would compile the replica's internals into the edge and hide the network hop the SLO is about.
+**Significance.** The browser in phase 5 talks only to this port. A coordinator that depends on the index project would compile the replica's internals into the edge and hide the network hop the SLO is about.
 
-`settings.gradle.kts` includes `coordinator` and `loadgen`.
+`settings.gradle.kts` includes `coordinator` and nothing else.
 
-`coordinator/build.gradle.kts` depends on `:api`, Jackson, slf4j, and logback. It does not depend on `:index` or `:oracle`. It has the application plugin, main class `io.aha.index.coord.CoordinatorMain`, default port `18483`.
+`coordinator/build.gradle.kts` applies the Spring Boot plugin and depends on `spring-boot-starter-web` only. `CoordinatorApplication` listens on port `18483`.
 
-`CoordinatorMain` starts an HTTP server that proxies `GET /v1/search` to `index-a` only, using `java.net.http.HttpClient`. Timeouts: connect 50ms, request 80ms. Forward the principal headers and `X-Request-Id`. Return the upstream body and status. `GET /v1/health` returns the coordinator's own status plus the upstream status code.
+`SearchController` proxies `GET /v1/search` to `index-a` only, using `java.net.http.HttpClient`. Timeouts: connect 50ms, request 80ms. Forward the principal headers and `X-Request-Id`. Return the upstream body and status. Do not pass `engine=sql`. `GET /v1/health` returns the coordinator's own status plus the upstream status code. `DemoPrincipalFilter` is copied into this project with the same rules. The coordinator does not depend on the index sources.
 
 This commit is a dumb proxy. Hedging comes next. Point the coordinator at the Compose index and confirm a search body comes back with status 200.
 
-Writes are not proxied to the index. `POST /v1/documents`, `POST /v1/acl`, `POST /v1/memberships` are proxied to the oracle base URL `ORACLE_URL` default `http://127.0.0.1:18480`. They are a single attempt. A hedge target is never called for `POST /v1/acl`.
+Writes are not proxied to an index replica. `POST /v1/documents`, `POST /v1/acl`, and `POST /v1/memberships` go to the writer, `WRITER_URL` default `http://127.0.0.1:18480`. They are a single attempt. A hedge target is never called for `POST /v1/acl`.
 
 Commit:
 
@@ -87,7 +90,7 @@ chore: add the coordinator module
 Why:
 Clients need one address. This commit introduces that process as a
 straight proxy so the hedge commit is a behavior change on its own.
-Writes go to Postgres through the oracle and are not retried.
+Writes go to the writer on 18480 and are not retried.
 
 Verify:
 ./gradlew :coordinator:compileJava
@@ -159,14 +162,14 @@ Algorithm:
 9. If the budget expires, return 503 `INDEX_UNAVAILABLE` when every observed failure was 503, otherwise 502 `UPSTREAM_FAILED`.
 10. At most one backup. There is no third try.
 
-With two local `HttpServer`s started from a small `main` you delete after the check:
+With two local stub processes started from a small `main` you delete after the check. Those stubs can be JDK `HttpServer` instances. They are stand-ins for a slow replica, not the service:
 
 - Primary sleeps 300ms, backup returns in 5ms. Hedge delay is forced by seeding p95 with samples of 10. The client observes a 200 from the backup's body and the elapsed time is under 150ms.
 - Primary returns 200 in 5ms. Assert the backup's request count stays 0. Give the backup a counter incremented at the start of its handler.
 - Primary returns 400. Backup's counter stays 0.
 - Both sleep 2 seconds and the deadline is 80ms. The caller returns 502 or 503 in under 500ms. Two seconds means cancellation is broken.
 
-The fake primary's sleep must be interruptible (`Thread.sleep` in the handler). `HttpServer` will still run it. Cancelling the HTTP future does not abort the server-side sleep. That is fine. The check is that the caller returns. The server-side sleep may continue. Leave that thread alone.
+The stub primary's sleep must be interruptible (`Thread.sleep` in the handler). Cancelling the HTTP future does not abort the server-side sleep. The check is that the caller returns. The server-side sleep may continue. Leave that thread alone.
 
 Commit:
 
@@ -355,7 +358,7 @@ Rules you apply, in this order, each as a small edit inside this one commit only
 4. The candidate `int` buffer is taken from a `ThreadLocal<int[]>` of length 256, grown by doubling and stored back if a query needs more. Each query thread keeps its own buffer.
 5. Do not build a `List<Integer>`.
 
-JMH lives in the `loadgen` module (or `index/src/jmh` if you prefer one module). A single benchmark `QueryEngineBenchmark` builds the 20_000-doc sparse corpus from phase 2 in memory, with confirm disabled, and scores the sparse user. Run:
+`settings.gradle.kts` gains `include("loadgen")` in this commit. It is the first code that needs a benchmark harness. A single benchmark `QueryEngineBenchmark` builds the 20_000-doc sparse corpus from phase 2 in memory, with confirm disabled, and scores the sparse user. Run:
 
 ```bash
 ./gradlew :loadgen:jmh
@@ -407,7 +410,7 @@ Write `docs/benchmarks/phase4.md` with the printed line, the fault configuration
 
 If p99 is over 100, leave the threshold at 100 and find the cause. Typical causes, in the order you should check:
 
-1. Confirm SQL is opening a new TCP connection per query. Add a pool of 8 connections (`HikariCP`, the version in the catalog). One pool per index process.
+1. Confirm SQL is opening connections outside `appDataSource`. Both pools already exist. Set the app pool's maximum size to 8 if the benchmark shows connection setup on the search path. One app pool per index process.
 2. The hedge delay is larger than 20ms because p95 was poisoned by the slow replica before ejection. Ejection should move the primary to `index-b`. Print which replica won. When `index-a` is still primary, the ejection window is wrong.
 3. JSON of the document body is in the response. Hits carry a snippet only.
 4. A `POST` is being hedged and serializing on the oracle.

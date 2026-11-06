@@ -9,9 +9,9 @@ git checkout main
 git checkout -b feature/phase-3-cdc-freshness
 ```
 
-You already have a correct index that is stale for grants until restart. This phase feeds it from Postgres logical replication. Revokes stay correct even during lag because `retainVisible` reads current rows. Grants become correct because the consumer adds them to the bitmap. If the consumer is too far behind, search returns 503 instead of a quietly incomplete index.
+You already have a correct index that is stale for grants until restart. This phase feeds that same application from Postgres logical replication. Kafka, Debezium, and `wal_level=logical` appear now, because this is the step that reads the log. Revokes stay correct even during lag because `retainVisible` reads current rows. Grants become correct because the consumer adds them to the bitmap. If the consumer is too far behind, search returns 503 instead of a quietly incomplete index.
 
-Still no frontend. The freshness probe is `deploy/freshness.sh`. This phase has no test sources.
+Still one Boot process, still no frontend, still no second Gradle module. The freshness probe is `deploy/freshness.sh`. This phase has no test sources.
 
 Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it.
 
@@ -21,7 +21,30 @@ Every commit opens with what it changes, why that change stands alone, and the s
 
 **Why.** The search path has to learn about commits from the WAL. Polling the tables either misses the 30 second bound under load or hammers Postgres on the same budget as queries. KRaft drops ZooKeeper from a single-node demo. Getting the brokers healthy is its own commit so a bad connector config is not confused with a broker that never started.
 
-**Significance.** Both index replicas in phase 4 read this log. An offset committed before the snapshot is published, or a broker that only one replica can see, skips a revoke on one of them.
+**Significance.** Phase 4 starts a second copy of this same application against this log. An offset committed before the snapshot is published skips a revoke on a restart.
+
+Postgres gains logical WAL in this commit, because the connector in the next commit cannot start without it. Recreate the data volume (`docker compose down -v`) so the setting and the new init script both apply. Phase 1 left this off on purpose.
+
+```yaml
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+```
+
+`deploy/postgres/init/02-debezium-role.sql`. The captured tables live in schema `search`, which is the schema phase 1 created.
+
+```sql
+CREATE ROLE debezium WITH REPLICATION LOGIN PASSWORD 'debezium';
+GRANT CONNECT ON DATABASE aha_index TO debezium;
+GRANT USAGE ON SCHEMA search TO debezium;
+GRANT SELECT ON ALL TABLES IN SCHEMA search TO debezium;
+ALTER DEFAULT PRIVILEGES IN SCHEMA search GRANT SELECT ON TABLES TO debezium;
+```
 
 Extend `deploy/docker-compose.yml`. Keep the Postgres service. Add:
 
@@ -63,7 +86,7 @@ The advertised listener is the Docker DNS name `kafka`. The index process, when 
 
 - Host development: add `127.0.0.1 kafka` is wrong because the advertised port inside the image is 9092, and the host mapped port is 19092. A client on the host using bootstrap `127.0.0.1:19092` receives metadata that says `kafka:9092` and then fails.
 - Fix: set `KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://127.0.0.1:19092"` when the consumer runs on the host. The Connect container must then also reach the broker at that address, which it cannot.
-- The clean fix for a one-broker demo: run the index replicas as compose services on the same network, bootstrap `kafka:9092`, and do not use the host port for the consumer. The host port 19092 is for `kcat` debugging. Set a second listener:
+- The application still runs on the host, on port 18480. It needs a listener it can resolve. Set a second listener:
 
 ```yaml
 KAFKA_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://0.0.0.0:19092,CONTROLLER://kafka:9093"
@@ -75,20 +98,7 @@ KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
 
 Map `"19092:19092"`. Connect uses `INTERNAL://kafka:9092` via `BOOTSTRAP_SERVERS: kafka:9092`. A host-side test uses `127.0.0.1:19092`.
 
-If the Debezium image's entrypoint overrides listener variables, read its `docker inspect` / docs for that tag and use the variable names it documents. The tutorial compose in the Debezium 3.7 examples is the fallback: one listener, and you run the consumer inside the compose network. Prefer running the replicas in compose (commit 6) over fighting advertised addresses.
-
-Postgres needs a replication role. Add `deploy/postgres/init/01-debezium-role.sql` and mount it on `/docker-entrypoint-initdb.d/01-debezium-role.sql`. This script runs only on a fresh volume. If your volume already exists from phase 1, run the SQL by hand once.
-
-```sql
-CREATE ROLE debezium WITH REPLICATION LOGIN PASSWORD 'debezium';
-GRANT CONNECT ON DATABASE aha_index TO debezium;
-\c aha_index
-GRANT USAGE ON SCHEMA public TO debezium;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO debezium;
-```
-
-`\c` does not run in every mount context. Split into two statements you execute with `psql -d aha_index` if the init script fails. The role must have `REPLICATION` and `SELECT` on the captured tables.
+If the Debezium image's entrypoint overrides listener variables, read its `docker inspect` / docs for that tag and use the variable names it documents. The host consumer uses `127.0.0.1:19092`. Connect uses `kafka:9092`. A second index process is phase 4.
 
 Bring the stack up:
 
@@ -137,7 +147,7 @@ curl -sf http://127.0.0.1:18083/connectors
     "database.password": "debezium",
     "database.dbname": "aha_index",
     "topic.prefix": "aha",
-    "table.include.list": "public.documents,public.acl_entries,public.group_memberships,public.users,public.groups,public.tenants",
+    "table.include.list": "search.documents,search.acl_entries,search.group_memberships",
     "publication.autocreate.mode": "filtered",
     "publication.name": "aha_publication",
     "slot.name": "aha_slot",
@@ -184,9 +194,9 @@ docker compose -f deploy/docker-compose.yml exec kafka bash -lc \
 
 Find the topics tool the image ships (`kafka-topics.sh` or similar) and list topics. You need to see, once the snapshot has run:
 
-- `aha.public.documents`
-- `aha.public.acl_entries`
-- `aha.public.group_memberships`
+- `aha.search.documents`
+- `aha.search.acl_entries`
+- `aha.search.group_memberships`
 - `aha.transaction`
 
 Force one partition. After the topics exist:
@@ -194,7 +204,7 @@ Force one partition. After the topics exist:
 ```bash
 # use the image's kafka-topics.sh path once you have listed it
 kafka-topics.sh --bootstrap-server kafka:9092 \
-  --alter --topic aha.public.documents --partitions 1
+  --alter --topic aha.search.documents --partitions 1
 ```
 
 You cannot decrease partitions. Create them at 1 before the snapshot by setting the broker default `KAFKA_NUM_PARTITIONS: "1"` in the kafka service environment before the first boot. Add that variable in this commit if the first boot already happened with a higher default, delete the topics and the connector offsets and start again. One partition is a requirement, not a tuning knob. Write that sentence at the top of `connector.json` is illegal in JSON; write it in `deploy/README.md` instead... do not add a second README. Put the sentence as a comment in `register-connector.sh`.
@@ -222,7 +232,7 @@ one consumer a deterministic replay.
 
 Verify:
 ./deploy/register-connector.sh
-topics aha.public.documents, aha.public.acl_entries, aha.transaction exist
+topics aha.search.documents, aha.search.acl_entries, aha.transaction exist
 ```
 
 ## Commit 3 — `feat: parse Debezium events and buffer a transaction`
@@ -233,7 +243,7 @@ topics aha.public.documents, aha.public.acl_entries, aha.transaction exist
 
 **Significance.** The applier in the next commit assumes the list it receives is one committed transaction, in order, once. A buffer that flushes early republishes the torn write the connector was added to prevent.
 
-Add `kafka-clients` to the index module.
+The parser uses Jackson, which the application already has. The Kafka client library is added in the commit that constructs a consumer.
 
 `io.aha.index.idx.cdc.ChangeEvent` is a sealed interface:
 
@@ -270,7 +280,7 @@ releases them in total_order. Snapshot reads have no transaction
 and apply immediately.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
 ## Commit 4 — `feat: apply a transaction into one published snapshot`
@@ -295,8 +305,8 @@ Snapshot read or a flushed transaction calls into the builder:
 | acl_entries | u | treat as delete of `before` plus insert of `after`. You do not update ACL rows in the HTTP API. Handle it anyway. |
 | group_memberships | r, c | `addMembership` |
 | group_memberships | d | `removeMembership` |
-| users, groups, tenants | r, c | ignore for search. They matter only so a snapshot that includes them does not crash the parser. Log at debug. |
-| users, groups, tenants | u, d | log a warning and ignore. Deleting a user does not cascade ACL rows in your schema (no FK from `acl_entries.principal_id`). A deleted user with leftover grants still cannot call the API unless the resolver accepts them. Add a test that a search for a user absent from the `users` table returns empty if you want; the visibility SQL already returns empty when there are no grants. Do not block phase 3 on user-delete cascades. |
+
+Users, groups, and tenants are not in the publication. The connector does not emit them, and the applier does not handle them. A deleted user with leftover grants still cannot call the API unless the resolver accepts them. The visibility SQL already returns empty when there are no grants. |
 
 After a snapshot read, you may publish every N events or on a timer so a huge snapshot becomes queryable only at the end. Do **not** set `ready=true` during snapshot. Publish `ready=false` snapshots if you want metrics. Health reports `ready=false`.
 
@@ -319,7 +329,7 @@ event keeps the same dense id, so replay-from-start does not
 duplicate documents.
 
 Verify:
-./gradlew :index:compileJava
+./gradlew compileJava
 ```
 
 ## Commit 5 — `feat: rebuild from the log on start and fail closed when the log is stale`
@@ -330,23 +340,23 @@ Verify:
 
 **Significance.** Serving a stale allow-set to keep latency would satisfy the p99 sentence and break the security sentence. Fail-closed is how both stay true. Phase 4 hedges only among replicas that pass this gate.
 
+Add `org.apache.kafka:kafka-clients` to the application dependencies in this commit. Nothing earlier opens a consumer.
+
 `io.aha.index.idx.cdc.LogConsumer`:
 
-- Properties: `bootstrap.servers` from `KAFKA_BOOTSTRAP` default `127.0.0.1:19092`. `group.id` from `CONSUMER_GROUP` default `index-replica-a`. `enable.auto.commit=false`. `auto.offset.reset=earliest`. `key.deserializer` and `value.deserializer` are `StringDeserializer`. `isolation.level=read_committed`. `max.poll.interval.ms=300000`.
-- Subscribe to the six data topics plus `aha.transaction`.
+- Properties: `bootstrap.servers` from `KAFKA_BOOTSTRAP` default `127.0.0.1:19092`. `group.id` from `CONSUMER_GROUP` default `aha-index`. `enable.auto.commit=false`. `auto.offset.reset=earliest`. `key.deserializer` and `value.deserializer` are `StringDeserializer`. `isolation.level=read_committed`. `max.poll.interval.ms=300000`. Phase 4 gives each copy its own group id. This phase has one consumer.
+- Subscribe to `aha.search.documents`, `aha.search.acl_entries`, `aha.search.group_memberships`, and `aha.transaction`.
 - `ConsumerRebalanceListener.onPartitionsAssigned`: `consumer.seekToBeginning(partitions)`. Set `ready=false`.
 - Loop: `poll(Duration.ofMillis(200))`. Parse, buffer, apply. This loop is one platform thread. Do not hand records to an executor.
 - When a poll returns an empty batch and you have been replaying, set `ready=true` and publish the current builders with `ready=true`. A later empty poll must not flip ready back to false.
 - `lagMs` is `clock.millis() - lastEventTsMs` when you have seen an event, else `Long.MAX_VALUE` while not ready, else 0 when ready and no event has ever arrived (empty database). `FRESHNESS_SLO_MS` default `30000`. If `lagMs > slo`, `search` throws `IndexNotReadyException` even if `ready` is true. The confirm SQL does not waive this. A stuck consumer must become a 503 so grants cannot be silently missing past the SLO.
 - Do not commit offsets. Replay-from-start is the restart story. A comment on the subscribe call states that a committed offset plus empty memory skips revokes.
 
-`IndexMain` when `BOOTSTRAP=log` starts `LogConsumer` on a platform thread and starts HTTP. `BOOTSTRAP=jdbc` stays for tests that do not want Kafka.
+`AhaIndexApplication` starts `LogConsumer` as a `SmartLifecycle` on a platform thread when `BOOTSTRAP=log`. Tomcat stays on port 18480. `BOOTSTRAP=jdbc` remains the phase-2 path, for a start that does not want Kafka. Do not replace this class with `@KafkaListener`. Offsets stay uncommitted: the restart story is seek-to-beginning, and a committed offset with empty memory would skip a revoke.
 
-`WatermarkTest` does not need Kafka. Drive `lagMs` with the fake clock and a published snapshot whose `appliedAtMillis` is 60 seconds before the clock. `QueryEngine.search` throws `IndexNotReadyException`. A second case: lag of 1 second does not throw.
+Drive `lagMs` from a `main` with a clock you set and a published snapshot whose `appliedAtMillis` is 60 seconds earlier. `QueryEngine.search` throws `IndexNotReadyException`. A second case, lag of 1 second, does not throw. There is no test class.
 
-Change `GrantIsInvisibleUntilReload` only in the next commit, when Kafka is in the test.
-
-Health JSON adds `lagMs`, `ready`, `appliedLsn`, `consumerGroup`.
+Health JSON adds `lagMs`, `ready`, `appliedLsn`, and `consumerGroup`. `appliedLsn` and `appliedAtMillis` are new fields on `IndexSnapshot`, filled from the event this commit applies.
 
 Commit:
 
@@ -360,26 +370,26 @@ is idempotent. Serving a replica whose last event is older than
 30 seconds would hide grants, so search returns 503.
 
 Verify:
-curl -s http://127.0.0.1:18481/v1/health
+curl -s http://127.0.0.1:18480/v1/health
 ```
 
 ## Commit 6 — `feat: show grant and revoke propagation on the compose log`
 
-**What.** `deploy/freshness.sh` grants through the oracle, polls the index until the document appears, revokes, polls until it disappears, then checks that a paused consumer with `FRESHNESS_SLO_MS=1000` returns 503. Elapsed times go into `docs/benchmarks/phase3.md`.
+**What.** `deploy/freshness.sh` posts a grant, polls search until the document appears, revokes, polls until it disappears, then checks that a paused consumer with `FRESHNESS_SLO_MS=1000` returns 503. Writes and reads are the same process on port 18480. Elapsed times go into `docs/benchmarks/phase3.md`.
 
 **Why.** The SLO is a wall-clock bound on the path from a Postgres commit to a search hit. JDBC bootstrap still hides a new grant until restart. This script is the record that the log path shows it, and that a stuck consumer refuses to answer.
 
 **Significance.** Phase 4's load run is only meaningful on a replica that already passes this script. A p99 measured against a bitmap that never sees a grant is a latency number for the wrong system.
 
-`deploy/freshness.sh` runs against the Compose stack. Ports 18480 (oracle writes) and 18481 (index reads).
+`deploy/freshness.sh` runs against the Compose stack and the one application on port 18480.
 
 1. Compose is up, the connector is registered, and the index is `BOOTSTRAP=log` with `FRESHNESS_SLO_MS=30000`.
 2. Wait until health `ready=true`, or stop at 60 seconds and treat that as a failed run.
 3. The seed is already in Postgres before the connector snapshot, so Ada's search for `quarterly` already returns three hits.
-4. `POST` a grant of `d-legal-1` to USER ada through the oracle. Leave the index process alone.
-5. Poll the index search every 200ms. `d-legal-1` appears within 30 seconds. The script prints the elapsed milliseconds.
-6. Revoke it through the oracle. Poll until `d-legal-1` is gone, within 30 seconds. The confirm path may drop it before the consumer applies the revoke. That still meets the bound.
-7. Stop the consumer. Start the index again with `FRESHNESS_SLO_MS=1000` and do not poll Kafka. After 1500ms, search returns 503.
+4. `POST` a grant of `d-legal-1` to USER ada on port 18480. Do not restart the process.
+5. Poll `GET /v1/search` on that same port every 200ms. `d-legal-1` appears within 30 seconds. The script prints the elapsed milliseconds.
+6. Revoke it on port 18480. Poll until `d-legal-1` is gone, within 30 seconds. The confirm path may drop it before the consumer applies the revoke. That still meets the bound.
+7. Stop the process. Start it again with `FRESHNESS_SLO_MS=1000` and do not poll Kafka. After 1500ms, search returns 503.
 
 Paste the elapsed times into `docs/benchmarks/phase3.md`.
 

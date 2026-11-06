@@ -8,23 +8,20 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [✅] First commit is the workbook
 - [ ] Section 0.7 of the setup guide is the schema you will migrate in phase 1
 
-## Phase 1 — `feature/phase-1-naive-oracle`
+## Phase 1 — one Spring Boot app, brute-force search
 
-- [ ] `chore: scaffold the Java 21 Gradle build`
+- [ ] `chore: scaffold one Spring Boot application`
 - [ ] `chore: run Postgres 16 and prove JDBC connects`
 - [ ] `feat: add the allow-grant schema and a migration runner`
-- [ ] `feat: add the shared tokenizer`
 - [ ] `feat: seed the canary corpus`
-- [ ] `feat: list the documents a user can read`
-- [ ] `feat: rank the visible set in memory and return ten hits`
-- [ ] `feat: serve the oracle over HTTP`
+- [ ] `feat: upload a document and grant or revoke it`
+- [ ] `feat: search the visible set with a term count`
 - [ ] `docs: record the phase-1 latency baseline`
 - [ ] Fast-forward `main`, tag `v0.1-naive`
 - [ ] Ada's curl has no canary. Ivan's first hit is the canary. No `web/` directory.
 
-## Phase 2 — `feature/phase-2-bitmap-prefilter`
+## Phase 2 — index inside the same application
 
-- [ ] `chore: add the index module`
 - [ ] `feat: assign dense doc ids and store document records`
 - [ ] `feat: build sorted postings lists`
 - [ ] `feat: score with BM25 into a fixed top-10 heap`
@@ -32,7 +29,7 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [ ] `feat: encode allow-grants as roaring bitmaps`
 - [ ] `feat: intersect postings with the visibility bitmap before scoring`
 - [ ] `feat: load a snapshot from Postgres and confirm candidates`
-- [ ] `feat: serve the index on port 18481`
+- [ ] `feat: serve indexed search from the same application`
 - [ ] `docs: record post-filter cost against pre-filter cost`
 - [ ] Fast-forward `main`, tag `v0.2-prefilter`
 - [ ] Revoke is visible on the next search without a restart. A new grant waits for a reload.

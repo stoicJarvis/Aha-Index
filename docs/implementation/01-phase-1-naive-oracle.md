@@ -1,168 +1,74 @@
-# Phase 1 — Naive oracle
+# Phase 1 — One Spring Boot app, brute-force search
 
 Branch: `feature/phase-1-naive-oracle`
 
 Tag when merged: `v0.1-naive`
 
-You build a correct search path that will miss the 100ms SLO on purpose. It is the authority for "who can see this document" in every later phase.
+This phase ends with one process on port 18480. You can upload a document, grant or revoke it, and search. Search loads every document the caller may read and ranks that set in memory. It is correct, and it is slow on purpose. There is no index, no Kafka, no second Gradle module, and no `web/` directory.
 
-This phase has no test sources. Each commit ends with `psql` or `curl`. The schema is the script in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7, copied into the migration file. Java follows section 0.6.
+The schema is the script in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7. Java follows section 0.6. This phase has no test sources. Each commit ends with `psql` or `curl`.
 
-Every commit opens with what it changes, why that change stands alone, and the significance for the phases after it. Read those three lines before the file list.
+Every commit states what it adds and why it waits until this commit.
 
 ```bash
 git checkout main
 git checkout -b feature/phase-1-naive-oracle
 ```
 
-There is no `web/` directory in this phase. There is no Kafka.
+## Commit 1 — `chore: scaffold one Spring Boot application`
 
-## Commit 1 — `chore: scaffold the Java 21 Gradle build`
+**What.** One Gradle project. One class, `io.aha.index.AhaIndexApplication`. `GET /v1/health` returns `{"status":"ok","mode":"naive"}`. Nothing else is on the classpath beyond the web starter, and `settings.gradle.kts` has no `include`.
 
-**What.** A multi-module Gradle build for `:analysis`, `:api`, and `:oracle`, on the Java 21 toolchain, with Spotless and the version catalog from the setup guide. No search behavior yet.
-
-**Why.** The process split is a dependency rule. Putting the modules in place before any query code means the oracle cannot quietly start importing the index, because the index module does not exist and the graph already points the other way.
-
-**Significance.** Phases 2 and 4 add processes that share JSON types and the tokenizer. If those types are born inside the oracle server, every later process either duplicates them or takes a dependency on the HTTP server. This commit is the seam they plug into.
-
-Create the files below. Search logic waits until commit 6.
-
-`.gitignore`:
-
-```gitignore
-.gradle/
-build/
-.idea/
-*.iml
-.classpath
-.project
-.settings/
-out/
-web/node_modules/
-web/.next/
-.DS_Store
-*.log
-```
+**Why.** The first thing a caller can do is hit an endpoint and see the process is the search service. A tokenizer, a schema, and an index have no caller yet, so they are not created. Health is the check that Boot, the port, and the wrapper are the ones this repo will keep.
 
 `settings.gradle.kts`:
 
 ```kotlin
 rootProject.name = "aha-index"
-include("analysis", "api", "oracle")
 ```
 
-`build.gradle.kts`:
+`build.gradle.kts` applies Java 21, Spring Boot 3.5.16, the dependency-management plugin 1.1.7, and Spotless. The only dependency is `spring-boot-starter-web`, with no version of its own. The Boot plugin fills that version from its BOM. Jackson, Logback, and the embedded server come from that starter. There is no version catalog yet. Section 0.5 is the pin list.
 
-```kotlin
-plugins {
-    java
-    id("com.diffplug.spotless") version "6.25.0" apply false
-}
+`src/main/resources/application.yml`:
 
-allprojects {
-    group = "io.aha.index"
-    version = "0.1.0-SNAPSHOT"
-    repositories {
-        mavenCentral()
-    }
-}
-
-subprojects {
-    apply(plugin = "java")
-    apply(plugin = "com.diffplug.spotless")
-
-    extensions.configure<JavaPluginExtension> {
-        toolchain {
-            languageVersion.set(JavaLanguageVersion.of(21))
-        }
-    }
-
-    tasks.withType<JavaCompile> {
-        options.compilerArgs.addAll(listOf("-parameters", "-Xlint:deprecation", "-Xlint:unchecked"))
-        options.encoding = "UTF-8"
-    }
-
-    extensions.configure<com.diffplug.gradle.spotless.SpotlessExtension> {
-        java {
-            target("src/main/java/**/*.java")
-            googleJavaFormat("1.22.0")
-        }
-    }
-}
+```yaml
+server:
+  address: 127.0.0.1
+  port: ${PORT:18480}
+spring:
+  threads:
+    virtual:
+      enabled: true
 ```
 
-`gradle/libs.versions.toml`: copy the catalog from [00-before-you-write-code.md](00-before-you-write-code.md) section 0.5.
-
-`analysis/build.gradle.kts`:
-
-```kotlin
-plugins { java }
-```
-
-`api/build.gradle.kts`:
-
-```kotlin
-plugins { java }
-
-dependencies {
-    implementation(libs.jackson.databind)
-}
-```
-
-`oracle/build.gradle.kts`:
-
-```kotlin
-plugins { java }
-
-dependencies {
-    implementation(project(":analysis"))
-    implementation(project(":api"))
-    implementation(libs.postgres)
-    implementation(libs.slf4j.api)
-    implementation(libs.logback)
-    implementation(libs.jackson.databind)
-}
-```
-
-If `libs.jackson.databind` does not match the alias Gradle generated from the catalog, run `./gradlew :api:dependencies` and fix the alias. Gradle rewrites `jackson-databind` in the catalog to the accessor `jackson.databind`.
-
-Generate the wrapper from any installed Gradle, or use the official wrapper jar. The required wrapper version is 8.11.1:
+`AhaIndexApplication` is `@SpringBootApplication`. `HealthController` sits in the same package, `io.aha.index`. One endpoint does not get its own directory. The name `web/` is reserved for the phase-5 console, which does not exist yet.
 
 ```bash
-gradle wrapper --gradle-version 8.11.1
+./gradlew bootJar
+curl -s http://127.0.0.1:18480/v1/health
 ```
 
-If you have no Gradle binary, download the 8.11.1 distribution zip from `https://services.gradle.org/distributions/gradle-8.11.1-bin.zip`, unpack it, and run its `bin/gradle wrapper --gradle-version 8.11.1` inside this repo. Commit `gradlew`, `gradlew.bat`, and `gradle/wrapper/*`.
+The second command needs `./gradlew bootRun` in another terminal. The body is `{"status":"ok","mode":"naive"}`.
 
-```bash
-./gradlew assemble
-java -version
-```
-
-`java -version` prints 21, and `assemble` exits 0. The tree has no `src/test` directory.
-
-Commit message:
+Commit:
 
 ```text
-chore: scaffold the Java 21 Gradle build
+chore: scaffold one Spring Boot application
 
 Why:
-Later phases split the oracle, the index, and the coordinator.
-The module boundaries exist before the search code so the oracle
-cannot grow a dependency on the index.
+The service has to answer on 18480 before it answers search.
+Libraries and modules wait until a commit calls them.
 
 Verify:
-./gradlew assemble
-java -version
+./gradlew bootJar
+curl -s http://127.0.0.1:18480/v1/health
 ```
 
 ## Commit 2 — `chore: run Postgres 16 and prove JDBC connects`
 
-**What.** Postgres 16 in Compose, with logical WAL already enabled, plus a JDBC ping from the oracle module through `DbConfig` and `DataSourceFactory`.
+**What.** Postgres 16 in Compose, the `aha_app` role, and two Hikari pools. A ping runner logs `SELECT 1` when `aha.ping=true`.
 
-**Why.** The oracle and the later candidate check both read this database. `wal_level=logical` is unused until phase 3, and changing it later destroys the data directory. Proving `SELECT 1` now separates "Docker and JDBC work" from "the schema is right."
-
-**Significance.** A freshness demo in phase 3 replays this same volume. A database created without a replication slot budget cannot grow a Debezium connector without a wipe, and a wipe throws away the corpus you are about to seed.
+**Why.** Search in this phase is a SQL query. The database is the next thing the app needs, and it is still a normal Postgres. Logical WAL, Kafka, and Debezium are how phase 3 hears about commits. Turning them on now would configure a log nobody reads. Phase 3 recreates the local volume when it enables `wal_level=logical`.
 
 `deploy/docker-compose.yml`:
 
@@ -181,42 +87,30 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
-    command:
-      - postgres
-      - -c
-      - wal_level=logical
-      - -c
-      - max_wal_senders=4
-      - -c
-      - max_replication_slots=4
     volumes:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
 ```
 
-`deploy/postgres/init/01-role.sql` is the role script from [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7. `CREATE ROLE` has to happen here, outside the migration transaction. The mount path is relative to `deploy/`, which is the compose file's directory.
+`deploy/postgres/init/01-role.sql` is the role script from section 0.7. `CREATE ROLE` cannot run inside the migration transaction, so it lives in the container's init directory. Init scripts run only on an empty data directory.
 
-`wal_level=logical` is unused until phase 3. Setting it now means you will not have to destroy the volume later to change it. Named volume is optional. Add one if you want data to survive `docker compose down`:
+Add `spring-boot-starter-jdbc` and `runtimeOnly("org.postgresql:postgresql")`. Exclude Boot's automatic pool so it does not open a third connection as the wrong role:
 
 ```yaml
-    volumes:
-      - aha_pg:/var/lib/postgresql/data
-volumes:
-  aha_pg:
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
 ```
 
-`io.aha.index.oracle.DbConfig` is a record: `String host, int port, String database, String user, String password`. `DbConfig.adminFromEnv()` reads `PGHOST` (default `127.0.0.1`), `PGPORT` (default `54329`), `PGDATABASE` (default `aha_index`), `PGUSER` (default `aha`), `PGPASSWORD` (default `aha`). `DbConfig.appFromEnv()` uses the same host, port, and database with `PGAPPUSER` (default `aha_app`) and `PGAPPPASSWORD` (default `aha_app`). Migrations and the seeder use the admin config. Request paths use the app config.
+`io.aha.index.db.DataSources` is a `@Configuration` with two `HikariDataSource` beans, `adminDataSource` and `appDataSource`. Both read `PGHOST` (default `127.0.0.1`), `PGPORT` (default `54329`), and `PGDATABASE` (default `aha_index`). The admin bean uses `PGUSER` / `PGPASSWORD` (default `aha` / `aha`). The app bean uses `PGAPPUSER` / `PGAPPPASSWORD` (default `aha_app` / `aha_app`). Migrations and the seeder borrow the admin pool. Request paths borrow the app pool, set `app.tenant_id`, and commit or roll back that connection themselves.
 
-`io.aha.index.oracle.DataSourceFactory` returns a `java.sql.DriverManager` connection. A pool arrives in phase 4. One method: `Connection open(DbConfig config)`.
-
-`io.aha.index.oracle.DbPing` has a `main` that opens the admin connection and prints the result of `SELECT 1`.
-
-Apply the application plugin on the oracle module in this commit, with `mainClass` set to `io.aha.index.oracle.DbPing`. Commit 8 changes `mainClass` to `OracleMain`. `DbPing` stays in the tree.
+`io.aha.index.db.DbPing` is an `ApplicationRunner` that borrows an admin connection, runs `SELECT 1`, and logs the value. It runs only when `aha.ping=true`.
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d postgres
-docker compose -f deploy/docker-compose.yml ps
-./gradlew :oracle:run
+./gradlew bootRun --args='--aha.ping=true'
 ```
+
+The log contains `1`. Stop the process with Ctrl-C.
 
 Commit:
 
@@ -224,45 +118,35 @@ Commit:
 chore: run Postgres 16 and prove JDBC connects
 
 Why:
-The oracle and the later candidate check both read Postgres.
-Logical WAL is on from the first boot so phase 3 does not
-recreate the data directory.
+Brute-force search is a query against Postgres.
+The log pipeline is phase 3's problem, so this database
+is a normal Postgres 16.
 
 Verify:
 docker compose -f deploy/docker-compose.yml ps
-./gradlew :oracle:run
-# prints 1
+./gradlew bootRun --args='--aha.ping=true'
 ```
 
 ## Commit 3 — `feat: add the allow-grant schema and a migration runner`
 
-**What.** The section 0.7 script becomes `V001__init.sql`, applied by a runner that records a SHA-256 checksum and refuses a changed script that was already applied.
+**What.** The section 0.7 script becomes `src/main/resources/db/V001__init.sql`. A runner applies it on the admin pool, stores the SHA-256 of the file in `schema_migrations`, and refuses to start when that checksum no longer matches a script that was already applied.
 
-**Why.** Visibility is the existence of an allow row. The table has no boolean to flip by mistake, the principal trigger rejects a grant to nobody, and row-level security is a second fence behind `tenant_id`. The checksum is how a later edit of `V001` is caught before it is applied to a database that already ran the old bytes.
+**Why.** The product rule is default-deny: no grant row means nobody can read the document, including the author. The tables are what the next commits insert into and what search will scan. Row-level security and the principal trigger are part of that rule, so they arrive with the tables rather than as a later hardening pass.
 
-**Significance.** Every later phase trusts these table names, this default-deny rule, and this primary key. Debezium will publish these tables. A second copy of the model, or a flag on `documents`, makes "who can read this" depend on which process you asked.
+The runner is an `ApplicationRunner` on the admin pool, ordered before the web server accepts traffic. It creates schema `search` if needed, applies `V001` inside one transaction when the checksum is new, and no-ops when the checksum matches. A changed file with the same version name is a startup failure.
 
-`oracle/src/main/resources/db/migration/V001__init.sql` is the script in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.7, byte for byte. That script creates schema `search`, the version table with a SHA-256 checksum, named constraints, `timestamptz` columns, the principal trigger, row-level security, and the `aha_app` role.
+```bash
+docker compose -f deploy/docker-compose.yml up -d postgres
+./gradlew bootRun
+```
 
-`REPLICA IDENTITY` stays `DEFAULT`. A delete event carries the primary key, which is what phase 3's applier needs.
-
-`io.aha.index.oracle.Migrator`, using the admin connection:
-
-1. Accept a `Connection` with `autoCommit` false.
-2. Apply the explicit list `String[] VERSIONS = { "V001__init.sql" }`. Locate each file on the classpath under `db/migration/`.
-3. `SELECT to_regclass('search.schema_migrations')`. When that is null, run `V001` with `Statement.execute` on the whole script (no `?` placeholders, so JDBC sends it as one simple query). Then insert the version row.
-4. The version row stores `version`, a short `description`, the hex SHA-256 `checksum` of the script bytes, and `execution_time_ms`.
-5. When the table exists and the version is present, compare the stored checksum to the file bytes. A mismatch throws. A match skips the file.
-6. Commit. A second `migrate()` is a no-op.
-
-Confirm with the admin role, which bypasses row-level security:
+In another terminal:
 
 ```bash
 psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "\dt search.*"
-psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "SELECT version, checksum FROM search.schema_migrations"
 ```
 
-`search.documents` and `search.acl_entries` are present. Running migrate again leaves `count(*)` at 1. Inserting a document before its tenant fails the foreign key. Inserting an ACL row for a missing user fails the principal trigger.
+The tables from section 0.7 are listed. Start the app a second time and the log says the migration is already applied.
 
 Commit:
 
@@ -270,61 +154,20 @@ Commit:
 feat: add the allow-grant schema and a migration runner
 
 Why:
-Visibility is the existence of an allow row. A missing row is a
-denial, so the schema has no allow-flag to get wrong. The runner
-records the script checksum so a later edit of V001 cannot pretend
-it was the script this database already applied.
+Search and the grant API both need the same tables.
+No grant row means the document is invisible, including to its author.
 
 Verify:
 psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "\dt search.*"
 ```
 
-## Commit 4 — `feat: add the shared tokenizer`
-
-**What.** One final class, `Tokenizer`, in `:analysis`. NFKC, root-locale lowercase, runs of letters and digits. No stemming, no stop-word list. Both `tokens` and `termFreq`.
-
-**Why.** The oracle in this phase and the index in phase 2 have to agree on what a match is. One class makes a ranking difference a ranking difference. Stemming would make the same document look different under two implementations and the curl comparison would be meaningless.
-
-**Significance.** Phase 2's BM25 and this phase's count score both call this class. If the index tokenizes on its own, "same hits as the oracle" stops being a check you can make with curl.
-
-Package `io.aha.index.analysis.Tokenizer`. Implement the algorithm in [00-before-you-write-code.md](00-before-you-write-code.md) section 0.8. The class is final. Methods are pure. No logging.
-
-These inputs are the contract. Commit 7's hit list is wrong when any row here is wrong.
-
-| Input | Tokens |
-| --- | --- |
-| `null` | empty |
-| `""` | empty |
-| `"Quarterly Revenue!"` | `quarterly`, `revenue` |
-| `"ADA's Q4"` | `ada`, `s`, `q4` |
-| `"café"` | `café` |
-| `"  quarterly   revenue  "` | `quarterly`, `revenue` |
-
-`termFreq("quarterly quarterly revenue")` returns quarterly=2, revenue=1. Calling `tokens` on the space-joined tokens of a letter-and-space string returns the same list.
-
-Commit:
-
-```text
-feat: add the shared tokenizer
-
-Why:
-The oracle and the index have to agree on what a token is.
-One class, no stemming, so a ranking diff is a ranking bug
-rather than a tokenizer drift.
-
-Verify:
-./gradlew :analysis:compileJava spotlessCheck
-```
-
-## Commit 5 — `feat: seed the canary corpus`
+## Commit 4 — `feat: seed the canary corpus`
 
 **What.** Two tenants, overlapping groups, and a fixed set of documents. `d-canary` matches the same words as ordinary documents and is granted only to Ivan. `d-orphan` has no grant. Forty filler documents are granted to contractors. Seeding twice leaves the same rows.
 
-**Why.** The canary is the leak detector: any missing tenant or ACL predicate returns it to Ada. The fillers are the limit detector: an unfiltered `LIMIT 10` hides Ada's documents behind Neil's corpus. A second tenant makes a missing `tenant_id` predicate fail in a way a single-tenant seed cannot.
+**Why.** The next two commits need rows whose answers you already know. The canary is the leak detector: any missing tenant or ACL predicate returns it to Ada. The fillers are the limit detector: an unfiltered `LIMIT 10` hides Ada's documents behind Neil's corpus. A second tenant makes a missing `tenant_id` predicate fail in a way a single-tenant seed cannot.
 
-**Significance.** Every later curl, freshness script, and benchmark uses these ids. Changing the body text or the grants changes the expected hit list for the rest of the project.
-
-`io.aha.index.oracle.CorpusSeeder.seed(Connection)` runs on the admin connection. It deletes, in foreign-key order, `acl_entries`, `group_memberships`, `documents`, `groups`, `users`, `tenants`, then inserts the rows below. It runs in one transaction. Calling it twice yields the same rows. Set `app.maintenance` is unnecessary on the admin connection because the owner bypasses row-level security.
+`io.aha.index.search.CorpusSeeder.seed(Connection)` runs on the admin connection when `SEED=true`. It deletes, in foreign-key order, `acl_entries`, `group_memberships`, `documents`, `groups`, `users`, `tenants`, then inserts the rows below. It runs in one transaction. Calling it twice yields the same rows. The owner bypasses row-level security, so the seeder does not set `app.tenant_id`.
 
 Tenants: `(acme, Acme)`, `(globex, Globex)`.
 
@@ -343,7 +186,7 @@ Groups: `acme/eng` Engineering, `acme/legal` Legal, `acme/contractors` Contracto
 
 Memberships: eng={ada, ben}, legal={cara}, contractors={neil}, staff={dana}. Ivan has no group.
 
-Documents and grants. Body text is exact. The `curl` checks in later commits match these strings.
+Documents and grants. Body text is exact. Later curls match these strings.
 
 | doc_id | tenant | title | body | grants |
 | --- | --- | --- | --- | --- |
@@ -373,7 +216,7 @@ SELECT principal_type, principal_id FROM search.acl_entries WHERE doc_id = 'd-ca
 SELECT count(*) FROM search.documents WHERE tenant_id = 'globex';        -- 1
 ```
 
-Seed a second time and repeat the counts. They stay the same.
+Seed a second time and the counts stay the same.
 
 Commit:
 
@@ -390,15 +233,13 @@ Verify:
 psql "postgresql://aha:aha@127.0.0.1:54329/aha_index" -c "SELECT count(*) FROM search.documents WHERE tenant_id = 'acme'"
 ```
 
-## Commit 6 — `feat: list the documents a user can read`
+## Commit 5 — `feat: upload a document and grant or revoke it`
 
-**What.** One SQL fragment, `VisibilitySql.PREDICATE`, and `DocumentStore` methods that list visible documents, confirm a candidate id list, and write documents, grants, and memberships. Inserting a document does not grant the author.
+**What.** Write routes on the same application: create a document, grant or revoke a principal, and add or remove a group membership. Creating a document does not grant the author. Reads of one document return 404 when the caller has no grant.
 
-**Why.** This predicate is the product rule: a direct user grant, or a group grant plus a current membership, inside the same tenant. Search and the later candidate check both paste this constant. A second copy will drift, and the drift is a document shown to the wrong person. A new document with no grant fails closed.
+**Why.** The problem is not search alone. A caller has to change who can read a document and see that change on the next request. These routes are the write side. Search is the next commit, and it will call the same visibility predicate these writes fill in.
 
-**Significance.** Phase 2's bitmap is an acceleration of this query, and phase 2 still calls `retainVisible` on the final candidates because a bitmap can lag a revoke. If this SQL is wrong, the fast path confirms the wrong answer faster.
-
-`io.aha.index.oracle.VisibilitySql`:
+`io.aha.index.search.VisibilitySql` is the predicate every read pastes. Do not copy it into a second string.
 
 ```java
 public final class VisibilitySql {
@@ -430,94 +271,84 @@ public final class VisibilitySql {
 }
 ```
 
-`a.tenant_id = d.tenant_id` already scopes the ACL row, so the fragment binds three values: user id, membership tenant, membership user.
+`DocumentStore` methods, each its own transaction on the app pool with `set_config('app.tenant_id', ?, true)`:
 
-`DocumentStore.visibleDocuments(Connection, tenant, user)` runs:
-
-```sql
-SELECT d.doc_id, d.title, d.body
-FROM documents d
-WHERE d.tenant_id = ?
-  AND <PREDICATE>
-ORDER BY d.doc_id ASC
-```
-
-Bind: tenant, user, tenant, user. Four binds because the statement has the tenant `?` plus three in the predicate.
-
-`DocumentStore.retainVisible(Connection, tenant, user, List<String> docIds)` runs the same predicate plus `AND d.doc_id = ANY (?)`. Return the subset, preserving the input order (filter the input list by the set the query returned). Empty input returns empty and does not hit the database.
-
-`DocumentStore` write methods, each its own transaction:
-
-- `insertDocument(tenant, docId, title, body)`. Tenant must exist. `docId` matches `^[a-z0-9][a-z0-9-]{0,63}$`, the same check as `documents_doc_id_format`. Title and body are non-blank after trim. Body length is at most 100_000 characters. A duplicate primary key throws the domain exception `AlreadyExists`. The connection is the app role with `app.tenant_id` set, so row-level security and the table checks both apply.
-- `grant(tenant, docId, principalType, principalId)`. Document must exist. USER must exist in `users` for the tenant. GROUP must exist in `groups`. Insert. On unique violation, return normally (idempotent grant).
-- `revoke(...)`. Delete the ACL row. Zero rows deleted is success.
+- `insertDocument(tenant, docId, title, body)`. Tenant must exist. `docId` matches `^[a-z0-9][a-z0-9-]{0,63}$`. Title and body are non-blank after trim. Body length is at most 100_000 characters. A duplicate primary key throws `AlreadyExists`. No ACL row is written.
+- `grant` / `revoke`. The document must exist. A USER must exist in `users` for the tenant. A GROUP must exist in `groups`. A unique violation on grant is success. Zero rows deleted on revoke is success.
 - `addMembership` / `removeMembership`. Same idempotent pattern. Both user and group must exist in the tenant.
+- `findVisible(tenant, user, docId)` returns the row only when the predicate matches. Otherwise the HTTP layer returns 404.
 
-`insertDocument` does not write an ACL row. A new document is invisible until a grant.
+Request records live in `io.aha.index.http` next to the controllers. The package is `http`, so it is not the phase-5 `web/` directory. Phase 4's coordinator forwards the response body and does not need these classes extracted into a library.
 
-Open an app-role session, `SELECT set_config('app.tenant_id', 'acme', true)`, and confirm:
+- `DocumentWrite(String docId, String title, String body)`
+- `AclWrite(String docId, String principalType, String principalId, String op)` where `op` is `GRANT` or `REVOKE`
+- `MembershipWrite(String groupId, String userId, String op)` where `op` is `ADD` or `REMOVE`
+- `ErrorBody(String error, String code)`
 
-| Call | Result |
-| --- | --- |
-| visible doc ids for acme/ada | `d-ada-1`, `d-eng-1`, `d-shared` only |
-| visible for acme/ivan | contains `d-canary`, does not contain `d-eng-1` |
-| visible for acme/cara | `d-legal-1`, `d-shared` |
-| visible for acme/neil | the 40 fillers only |
-| visible for globex/dana | `d-globex-1` |
-| visible for acme/dana | empty |
-| visible for globex/ada | empty |
-| retainVisible(ada, [d-canary, d-eng-1, d-orphan]) | `[d-eng-1]` |
-| insert `d-new` with no grant, visible for ada | does not contain `d-new` |
-| grant USER ada on `d-new`, visible for ada | contains `d-new` |
-| revoke that grant | does not contain `d-new` |
-| remove ada from eng | ada loses `d-eng-1` and `d-shared`, keeps `d-ada-1` |
+`DemoPrincipalFilter` is a `OncePerRequestFilter` and the only class that reads `X-Tenant-Id` and `X-User-Id`. `AUTH_MODE=token` ignores those headers and returns 401 for any route that needs a principal. `ApiExceptionHandler` writes the error JSON from section 0.11. A filter rejects a body larger than 1 MiB with 413 `BODY_TOO_LARGE`.
 
-The membership case is the one people get wrong. `d-shared` is granted to eng and to legal. Ada is only in eng. Removing her from eng removes both eng documents.
+Routes, principal required:
+
+- `POST /v1/documents` uses the principal's tenant. 201 on insert, 409 `ALREADY_EXISTS` on duplicate.
+- `POST /v1/acl` returns 204. 404 unknown document. 422 unknown principal. Idempotent grant and revoke return 204.
+- `POST /v1/memberships` returns 204, or 422 when the user or group is not in the tenant.
+- `GET /v1/documents/{docId}` returns 200 with title and body when visible, 404 otherwise.
+
+With `SEED=true` and the server up:
+
+- POST `d-temp` as Ada. GET it as Ada returns 404. POST a USER grant for Ada. GET as Ada returns 200. GET as Ben returns 404. POST the revoke. GET as Ada returns 404 again.
+- Remove Ada from `eng`. She can still GET `d-ada-1`. She can no longer GET `d-eng-1` or `d-shared`.
 
 Commit:
 
 ```text
-feat: list the documents a user can read
+feat: upload a document and grant or revoke it
 
 Why:
-The visibility predicate is the product invariant. Search and the
-later candidate check both call this one SQL fragment.
-A document insert does not grant the author, so a forgotten grant
-fails closed.
+The caller has to change who can read a document.
+A new document stays invisible until a grant, including to its author.
 
 Verify:
-psql as aha_app with app.tenant_id=acme, Ada's visible ids are d-ada-1, d-eng-1, d-shared
+SEED=true ./gradlew bootRun
+# POST d-temp, GET 404, GRANT ada, GET 200, REVOKE, GET 404
 ```
 
-## Commit 7 — `feat: rank the visible set in memory and return ten hits`
+## Commit 6 — `feat: search the visible set with a term count`
 
-**What.** `NaiveSearch` loads every document the user may read, keeps those that contain every query token, scores them with `3 * title count + 1 * body count`, and returns at most 10. The SQL has no `LIMIT`.
+**What.** `GET /v1/search?q=` loads every document the caller may read, keeps those that contain every query token, scores them with `3 * title count + 1 * body count`, and returns at most 10. The SQL has no `LIMIT`.
 
-**Why.** The database returns the whole visible set, and ranking happens after that filter. An unfiltered keyword query with `LIMIT 10` returns the first ten matching rows in the table, which are Neil's fillers, and Ada's documents disappear. The slowness is the lesson commit 9 writes down.
+**Why.** This is the brute-force answer to the problem: filter by grant first, then rank, then cut to 10. An unfiltered keyword query with `LIMIT 10` returns Neil's fillers and Ada's documents disappear. The tokenizer is a class in this commit because search is its first caller. Phase 2 will call the same class. A separate module would be a jar with one type and no second process.
 
-**Significance.** This class is the authority for "these ids, for this user." Phase 2 may change the score to BM25. It may not change who is allowed to see a row. The curl order in the next commit is the record of this score.
+`io.aha.index.search.Tokenizer` follows section 0.8. NFKC, root-locale lowercase, runs of letters and digits. No stemming, no stop-word list. The class is final. Methods are pure.
 
-`io.aha.index.oracle.NaiveSearch`:
+| Input | Tokens |
+| --- | --- |
+| `null` | empty |
+| `""` | empty |
+| `"Quarterly Revenue!"` | `quarterly`, `revenue` |
+| `"ADA's Q4"` | `ada`, `s`, `q4` |
+| `"café"` | `café` |
+| `"  quarterly   revenue  "` | `quarterly`, `revenue` |
 
-```java
-public List<Hit> search(Connection conn, String tenant, String user, String query)
-```
+`termFreq("quarterly quarterly revenue")` returns quarterly=2, revenue=1.
 
-1. `List<String> queryTokens = tokenizer.tokens(query)`.
-2. If `queryTokens` is empty, throw `NoTokensException`. The HTTP layer maps it to 400. The library does not know about HTTP.
-3. `List<DocumentRow> rows = documentStore.visibleDocuments(...)`.
-4. For each row, `titleFreq = tokenizer.termFreq(title)`, `bodyFreq = tokenizer.termFreq(body)`.
-5. The row matches when every query token has `(titleFreq.getOrDefault(t,0) + bodyFreq.getOrDefault(t,0)) > 0`.
-6. Score is `sum over query tokens of (3 * titleCount + 1 * bodyCount)`.
-7. Sort by score descending, then `docId` ascending.
-8. Return at most 10.
-9. Snippet: concatenate `title + "\n" + body`, lowercase with the same NFKC + ROOT lowercase the tokenizer uses, find the first query token, take 60 characters before and 100 after, prefix `...` when the start was trimmed. Run this only for returned hits.
+`NaiveSearch.search(Connection, tenant, user, query)`:
 
-There is no `LIMIT` in the SQL of this class. The database returns the whole visible set. The slowness is the point.
+1. Tokenize the query. An empty token list becomes 400 `NO_TOKENS`.
+2. Load the visible rows with the predicate from commit 5. Bind tenant, user, tenant, user. Order by `doc_id`.
+3. A row matches when every query token occurs in the title or the body.
+4. Score is the sum over query tokens of `3 * title count + 1 * body count`.
+5. Sort by score descending, then `docId` ascending. Return at most 10.
+6. Snippet, only for returned hits: concatenate `title + "\n" + body`, lowercase the same way the tokenizer does, find the first query token, take 60 characters before and 100 after, and prefix `...` when the start was trimmed.
 
-Query `quarterly` unless noted. These are the results commit 8's `curl` must show.
+Response records, same package as the other JSON types:
 
-Phase-1 scores for token `quarterly` (title count × 3 + body count × 1):
+- `SearchHit(String docId, String title, String snippet, double score)`
+- `SearchResponse(List<SearchHit> hits, String mode, String replica, boolean hedged, String aclEpoch, long watermarkLagMs)`
+
+`mode` is `naive`, `replica` is `oracle`, `hedged` is false, `aclEpoch` is `"0"`, `watermarkLagMs` is 0. Those fields stay, so later phases can change the engine without changing the client. `GET /v1/directory` lists tenants and users for the phase-5 switcher. It needs no principal in demo mode and returns 401 when `AUTH_MODE=token`.
+
+Phase-1 scores for token `quarterly`:
 
 | doc | title count | body count | score | visible to |
 | --- | --- | --- | --- | --- |
@@ -531,89 +362,9 @@ Phase-1 scores for token `quarterly` (title count × 3 + body count × 1):
 | d-globex-1 | 1 | 1 | 4 | dana |
 | each filler | 0 | 1 | 1 | neil |
 
-Ada, query `quarterly`, exact order: `d-ada-1`, `d-eng-1`, `d-shared`.
+Ada, query `quarterly`, exact order: `d-ada-1`, `d-eng-1`, `d-shared`. The tie on score 4 breaks by doc id, and `d-ada-1` < `d-eng-1`. Ivan's first hit is `d-canary`. Ada's hits do not contain `d-canary`, `d-orphan`, `d-legal-1`, `d-ben-1`, any `f-*`, or `d-globex-1`. Neil gets `f-01` through `f-10`.
 
-Tie on score 4 is broken by doc id ascending, and `d-ada-1` < `d-eng-1`.
-
-Ivan's first hit is `d-canary`. Ada's hits do not contain `d-canary`, `d-orphan`, `d-legal-1`, `d-ben-1`, any `f-*`, or `d-globex-1`.
-
-Cara, query `quarterly revenue` (both tokens required): `d-legal-1` then `d-shared`. `d-ben-1` contains `quarterly` and not `revenue`, so it is out even for Ben on this two-token query.
-
-Neil gets 10 hits, all with ids starting `f-`, which are the lexicographically first 10 fillers because they tie on score. `f-01` through `f-10`.
-
-Query `...` throws `NoTokensException`.
-
-Query `quarterly` as user `nobody` in tenant `acme` returns an empty list, not an exception.
-
-Commit:
-
-```text
-feat: rank the visible set in memory and return ten hits
-
-Why:
-The SQL path returns every document the user may read, and only
-those. Ranking and LIMIT happen after that filter. Putting LIMIT
-in an unfiltered keyword query hides Ada's documents behind the
-contractor fillers.
-
-Verify:
-./gradlew :oracle:compileJava
-```
-
-## Commit 8 — `feat: serve the oracle over HTTP`
-
-**What.** The JSON records in `:api`, and an HTTP server on port 18480: search, document read, document write, ACL, membership, directory, and health. Demo headers are read only by `PrincipalResolver`. Writes commit to Postgres and the next search sees them.
-
-**Why.** The response fields (`hits`, `mode`, `replica`, `hedged`, `aclEpoch`, `watermarkLagMs`) are fixed here so later processes can replace the implementation. The oracle has no cache, which is why a grant is visible on the next search. Token mode returns 401 so the demo headers are a harness, not a credential.
-
-**Significance.** The coordinator, the load generator, and the console all speak this shape. A field renamed in phase 4 breaks every client that already parsed phase 1. Search is the only route later phases are allowed to hedge, because these writes are the source of truth.
-
-`io.aha.index.api` records, Jackson-friendly (public accessors, no logic):
-
-- `SearchHit(String docId, String title, String snippet, double score)`
-- `SearchResponse(List<SearchHit> hits, String mode, String replica, boolean hedged, String aclEpoch, long watermarkLagMs)`
-- `ErrorBody(String error, String code)`
-- `DocumentWrite(String docId, String title, String body)`
-- `AclWrite(String docId, String principalType, String principalId, String op)` where `op` is `GRANT` or `REVOKE`
-- `MembershipWrite(String groupId, String userId, String op)` where `op` is `ADD` or `REMOVE`
-- `DirectoryUser(String userId, String displayName)`
-- `DirectoryTenant(String tenantId, String name, List<DirectoryUser> users)`
-
-`ObjectMapper` is one shared instance, `FAIL_ON_UNKNOWN_PROPERTIES` enabled.
-
-`io.aha.index.oracle.OracleServer`:
-
-- `HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0)`.
-- Port from `PORT`, default `18480`.
-- Executor: `Executors.newVirtualThreadPerTaskExecutor()`.
-- Each request opens an app-role JDBC connection, sets `app.tenant_id` to the resolved tenant, and closes the connection in `finally`. Phase 1 does not pool. Directory and migrate use the admin connection.
-- `GET /v1/health` returns 200 `{"status":"ok","mode":"naive"}` with no principal required.
-- `GET /v1/directory` lists tenants and users. Demo mode only. No principal required. This exists so phase 5 can fill the switcher. It is not a secret in demo mode. In `AUTH_MODE=token` return 401.
-- `GET /v1/search?q=` principal required. `mode` is `naive`, `replica` is `oracle`, `hedged` false, `aclEpoch` `"0"`, `watermarkLagMs` 0. This process reads Postgres directly, so it is not behind a log.
-- `GET /v1/documents/{docId}` principal required. 200 with title and body when visible, 404 otherwise.
-- `POST /v1/documents` principal required. The principal's tenant is the document's tenant. Body is `DocumentWrite`. 201 on insert, 409 `ALREADY_EXISTS` on duplicate.
-- `POST /v1/acl` body `AclWrite`. 204 on success. 404 unknown document. 422 unknown principal. Idempotent grant and revoke return 204.
-- `POST /v1/memberships` body `MembershipWrite`. 204, 422 if the user or group is not in the tenant.
-- Unknown path: 404 `NOT_FOUND`.
-- Read the body with a cap of 1 MiB.
-
-Log one line per request at info: method, path, status, millis, request id, tenant, user, and `qLength`. The query text is debug. Document bodies stay out of the log.
-
-`oracle/src/main/resources/logback.xml`: console appender, pattern `%d{ISO8601} %-5level [%thread] %logger - %msg%n`, root level info.
-
-`OracleMain.main` loads admin and app configs from the environment, migrates and optionally seeds on the admin connection when `SEED=true`, then starts the server and blocks. `AuthMode` is a constructor argument. `main` reads `AUTH_MODE`.
-
-With the server up against Compose, these curls are the check:
-
-- Ada search `quarterly` returns `d-ada-1`, `d-eng-1`, `d-shared`, in that order, and the body does not contain `d-canary`.
-- Missing headers return 400 `MISSING_PRINCIPAL`.
-- Restart with `AUTH_MODE=token`. Search with the demo headers returns 401.
-- POST a document `d-temp`, search as ada and see it absent, POST grant USER ada, search again and see it present, POST revoke, and see it absent.
-- GET that document as ben returns 404 while it is granted to ada. GET as ada returns 200 while granted.
-- Query `%%%` returns 400 `NO_TOKENS`.
-- Ivan's first hit for `quarterly` is `d-canary`.
-
-Add a `Makefile` or `deploy/run-oracle.sh`:
+`deploy/run-oracle.sh`:
 
 ```bash
 #!/usr/bin/env bash
@@ -621,32 +372,8 @@ set -euo pipefail
 export PGHOST="${PGHOST:-127.0.0.1}"
 export PGPORT="${PGPORT:-54329}"
 export SEED="${SEED:-true}"
-./gradlew :oracle:installDist
-./oracle/build/install/oracle/bin/oracle
+./gradlew bootRun
 ```
-
-The application plugin is already applied. Point `mainClass` at `io.aha.index.oracle.OracleMain`.
-
-Commit:
-
-```text
-feat: serve the oracle over HTTP
-
-Why:
-The HTTP shape (hits, mode, replica, hedged, aclEpoch, watermark)
-is fixed here so later processes can replace the implementation
-without breaking clients. Writes land in Postgres and become
-visible on the next search because this process has no cache.
-
-Verify:
-SEED=true ./deploy/run-oracle.sh
-curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' \
-  'http://127.0.0.1:18480/v1/search?q=quarterly'
-curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ivan' \
-  'http://127.0.0.1:18480/v1/search?q=quarterly'
-```
-
-Ada's body contains `d-ada-1`, `d-eng-1`, `d-shared`, and does not contain `d-canary`. Ivan's first hit is `d-canary`.
 
 The bug this phase refuses to ship is an unfiltered limit. This query hides Ada behind Neil's fillers:
 
@@ -657,37 +384,40 @@ ORDER BY doc_id ASC
 LIMIT 10;
 ```
 
-Run it as `aha` and compare the ids with Ada's curl. They differ. `NaiveSearch` keeps the filter in the SQL and limits after ranking.
+Run it as `aha` and compare the ids with Ada's curl. They differ.
 
-## Commit 9 — `docs: record the phase-1 latency baseline`
+Commit:
 
-**What.** A benchmark main grows the tenant to at least 5,000 documents and records min, p50, p99, and max for Ada's `quarterly` search, plus the `EXPLAIN` plan, in `docs/benchmarks/phase1.md`.
+```text
+feat: search the visible set with a term count
 
-**Why.** The SLO is 100ms at p99. This commit writes down that the correct oracle misses it, and by how much, before any index exists. An index on `body` that makes this fast would hide the reason phase 2 exists.
+Why:
+Filter by grant, then rank, then return 10.
+An unfiltered LIMIT 10 answers Neil's fillers and drops Ada.
 
-**Significance.** Phase 2's benchmark is a comparison against this page. Without the number and the sequential plan, "the index is faster" has nothing to be faster than.
-
-`io.aha.index.oracle.NaiveBenchmark` is a `main` under `src/main`. It:
-
-1. Expects compose Postgres up, migrates, seeds.
-2. Inserts extra filler documents until the tenant `acme` has at least 5_000 documents containing the word `quarterly`, granted to GROUP contractors. Page the inserts in batches of 200 per transaction.
-3. Warms 20 searches as ada for `quarterly`.
-4. Times 200 searches. Record min, p50, p99, max in milliseconds. p99 index is `ceil(0.99 * 200) - 1` on the sorted samples (index 197 of 200).
-5. Prints one line: `phase1 ada quarterly n=200 p50=.. p99=.. max=.. docs=5000+`.
-
-Write the numbers into `docs/benchmarks/phase1.md` by hand from that output, with the date, the machine (cpu and RAM), and the sentence: "This p99 is above the 100ms SLO. Phase 2 is the response." Leave the SQL as it is. An index on `body` that makes this fast hides the lesson.
-
-Also paste the result of:
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS)
-SELECT d.doc_id
-FROM search.documents d
-WHERE d.tenant_id = 'acme'
-  AND EXISTS ( ... the visibility predicate for ada ...);
+Verify:
+SEED=true ./deploy/run-oracle.sh
+curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' \
+  'http://127.0.0.1:18480/v1/search?q=quarterly'
+curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ivan' \
+  'http://127.0.0.1:18480/v1/search?q=quarterly'
 ```
 
-The plan in the markdown shows the sequential work.
+Ada's body contains `d-ada-1`, `d-eng-1`, `d-shared`, and does not contain `d-canary`. Ivan's first hit is `d-canary`. Missing headers return 400 `MISSING_PRINCIPAL`. Query `%%%` returns 400 `NO_TOKENS`. `AUTH_MODE=token` returns 401 for the same curl.
+
+## Commit 7 — `docs: record the phase-1 latency baseline`
+
+**What.** A `main` grows the tenant to at least 5,000 documents and records min, p50, p99, and max for Ada's `quarterly` search, plus the `EXPLAIN` plan, in `docs/benchmarks/phase1.md`.
+
+**Why.** The SLO is 100ms at p99. This commit writes down that the correct scan misses it, and by how much, before any index exists. An index on `body` that makes this fast would hide the reason phase 2 exists. JMH is not added. The main is one class, `io.aha.index.search.NaiveBenchmark`.
+
+1. Expect Compose Postgres up, migrate, and seed.
+2. Insert extra filler documents until tenant `acme` has at least 5,000 documents containing `quarterly`, granted to GROUP contractors. Batches of 200 per transaction.
+3. Warm 20 searches as Ada for `quarterly`.
+4. Time 200 searches. p99 index is `ceil(0.99 * 200) - 1` on the sorted samples (index 197 of 200).
+5. Print `phase1 ada quarterly n=200 p50=.. p99=.. max=.. docs=5000+`.
+
+Write the numbers into `docs/benchmarks/phase1.md` by hand, with the date, the machine, and the sentence: "This p99 is above the 100ms SLO. Phase 2 is the response." Paste the `EXPLAIN (ANALYZE, BUFFERS)` of Ada's visibility query. The plan shows the sequential work.
 
 Commit:
 
@@ -696,10 +426,10 @@ docs: record the phase-1 latency baseline
 
 Why:
 The SLO is 100ms at p99. This commit writes down that the correct
-oracle misses it, and by how much, before any index exists.
+scan misses it, before any index exists.
 
 Verify:
-java -cp ... io.aha.index.oracle.NaiveBenchmark
+java -cp ... io.aha.index.search.NaiveBenchmark
 docs/benchmarks/phase1.md filled in
 ```
 
@@ -710,13 +440,16 @@ docs/benchmarks/phase1.md filled in
 git status
 git checkout main
 git merge --ff-only feature/phase-1-naive-oracle
-git tag -a v0.1-naive -m "Naive SQL oracle, default-deny search, baseline latency"
+git tag -a v0.1-naive -m "Brute-force search in one Spring Boot app"
 ```
 
 Exit bar:
 
 - `./gradlew assemble` exits 0 and the tree has no `src/test`.
+- `settings.gradle.kts` has no `include`.
 - Curl as Ada does not return the canary. Curl as Ivan returns it first for `quarterly`.
+- A document posted with no grant is invisible to its author until `POST /v1/acl`.
 - `docs/benchmarks/phase1.md` exists and states the SLO miss.
-- `git tag --list 'v0.1-naive'` prints the tag.
 - The tree has no `web/` directory and no `package.json`.
+
+Phase 2 adds the index inside this same application. It does not add a process.
