@@ -3,7 +3,7 @@
 
 Build one service that, for a tenant-scoped user and a keyword query, returns the 10 readable documents with the best BM25 scores. A document with no allow-grant is invisible. A grant, revoke, or group-membership change committed in Postgres is reflected in search within 30 seconds. Under normal load, 99% of queries finish within 100ms server time even when one index replica is degraded.
 
-The phase-1 SQL implementation is never deleted. It remains the differential-testing oracle for every later phase.
+The phase-1 SQL implementation is never deleted. It remains the visibility authority every later phase calls before it returns hits.
 
 ## 1. Production Tech Stack and Justification
 
@@ -15,7 +15,7 @@ The Java Memory Model is part of the design, not an accident. Index publication 
 
 Garbage collection is sized for the latency budget. Generational ZGC on Java 21 keeps stop-the-world pauses well under the 100ms SLO, but a concurrent collector does not forgive an allocating query path: allocation rate still burns CPU and fills the heap. Scoring therefore uses primitive arrays, a reused size-10 heap, and roaring containers instead of `HashSet<Long>`. Virtual threads are used for the phase-1 JDBC oracle and for Kafka polling. The phase-4 scorer stays on a small platform-thread pool. Virtual threads do not speed a CPU-bound intersection, and an unbounded virtual-thread fanout would oversubscribe the same cores the scorer needs.
 
-HTTP at the edge is JSON (Jackson) so the UI and tests can read responses. Replica fanout uses length-prefixed binary frames (varint doc ids, raw doubles) so hedge traffic does not pay Jackson’s object graph. Protobuf is the production upgrade once the frame format stops changing; the wire shape is designed to match it.
+HTTP at the edge is JSON (Jackson) so the UI and `curl` can read responses. Replica fanout uses length-prefixed binary frames (varint doc ids, raw doubles) so hedge traffic does not pay Jackson’s object graph. Protobuf is the production upgrade once the frame format stops changing; the wire shape is designed to match it.
 
 Processes, not a monolith of frameworks:
 
@@ -35,7 +35,7 @@ Per tenant:
 - Dictionary: term → sorted postings of dense `int` doc ids plus term frequency.
 - Document table: dense id → external id, title, body length, token count.
 - Live-doc roaring bitmap (deletes are tombstones, ids are not recycled during a process lifetime).
-- BM25 with `k1 = 1.2`, `b = 0.75`. Tie-break by doc id so tests are deterministic.
+- BM25 with `k1 = 1.2`, `b = 0.75`. Tie-break by doc id so the same corpus always returns the same order.
 - Tokenizer: Unicode casefold and a word-boundary split. Stemming stays out of v1 so relevance diffs are explainable.
 
 Dense integer ids are mandatory. Roaring bitmaps want 32-bit keys; UUIDs in a `HashSet` would dominate both memory and intersection time. A monotonic dictionary maps external id → int.
@@ -168,11 +168,11 @@ Goal: functional correctness only. One process, one Postgres, synchronous ACL ch
 - Schema and seed: two tenants, users in overlapping groups, documents that contain shared keywords, grants that make the correct top-10 differ per user. Include a document whose body matches every query and that almost nobody can read. That document is the canary for leaks.
 - Search: `ILIKE` on title and body, `EXISTS` allow-grant for the user or their groups, `ORDER BY` a trivial score (term occurrence count) with a hard cap. Post-filter in SQL, not in application memory after an unfiltered `LIMIT 10`. An unfiltered limit is the classic bug: the true top 10 authorized docs sit behind 10 unauthorized hits and disappear.
 - API: `GET /v1/search?q=`, `POST /v1/acl`, `POST /v1/documents`.
-- Tests: JUnit property tests (jqwik) generate random allow-sets and assert every hit has a grant, every hit belongs to the tenant, and a revoked canary never appears. An integration test runs the canary query as every seeded user.
-- Record a baseline histogram in the commit message body and in `docs/benchmarks/phase1.md`. Expect p99 far above 100ms once the seed grows. Do not “fix” it in this phase.
-- UI: query box, identity switcher, result list. Enough to demo correctness.
+- Hand check: `curl` the canary query as every seeded user. Every hit belongs to that tenant and that user’s grants. The canary appears for Ivan and for nobody else.
+- Record a baseline histogram in the commit message body and in `docs/benchmarks/phase1.md`. Expect p99 far above 100ms once the seed grows. Leave that miss in place for this phase.
+- UI: query box, identity switcher, result list. Enough to demo correctness. The UI lands in phase 5, after the backend SLO.
 
-Exit bar: leak tests green; baseline numbers written down; UI can switch user and see a different hit list for the same words.
+Exit bar: Ada’s curl has no canary; Ivan’s first hit is the canary; baseline numbers are written down.
 
 ### Phase 2 — Index and security pre-filter
 
@@ -181,11 +181,11 @@ Goal: same results as the oracle, without a sequential scan, by intersecting pos
 - Build the in-memory index inside the process from a full Postgres read at startup. Freshness is still “restart to see a grant”. That limitation is explicit and is what phase 3 removes.
 - Implement dictionary, postings, BM25, size-10 heap, live-doc bitmap.
 - Build per-principal roaring bitmaps from `acl_entries` and memberships.
-- Query path pre-filters. A debug flag `SHADOW_ORACLE=true` runs the SQL oracle on every query in tests and asserts set equality of the top 10 ids.
-- Add a microbenchmark that sweeps selectivity (user can see 50%, 5%, 0.1% of docs) and writes `docs/benchmarks/phase2.md` comparing post-filter candidate counts against pre-filter. The story to tell: post-filter latency tracks the unauthorized corpus; pre-filter tracks the visible corpus.
+- Query path pre-filters. Compare the index `curl` hit ids with the oracle `curl` hit ids on the seeded corpus.
+- Add a benchmark main that sweeps selectivity (user can see 50%, 5%, 0.1% of docs) and writes `docs/benchmarks/phase2.md` comparing post-filter candidate counts against pre-filter. The story to tell: post-filter latency tracks the unauthorized corpus; pre-filter tracks the visible corpus.
 - Snapshot publication via `volatile` is introduced here, even with a single writer at startup, so phase 3’s applier has a place to publish.
 
-Exit bar: differential test holds across the seeded corpus and the property suite; benchmark shows pre-filter cost flattening as unauthorized corpus grows.
+Exit bar: index and oracle return the same seeded hit ids; the benchmark shows pre-filter cost flattening as the unauthorized corpus grows.
 
 ### Phase 3 — 30 second freshness
 
@@ -197,10 +197,10 @@ Goal: a committed grant or revoke shows up without a restart, and a lagging inde
 - Revoke overlay subtracted on every query.
 - `GET /v1/health/watermark` returns `appliedLsn`, `lagMs`, `overlaySize`.
 - Coordinator returns 503 with `Retry-After` when the freshest replica is older than 30 seconds.
-- Integration test: commit a revoke, poll search until the doc disappears, fail the test if it is still present at 30 seconds. A twin test covers grant. A third test pauses the consumer, advances the clock (injectable clock), and expects 503 rather than a hit.
+- Hand check: commit a revoke, poll search until the doc disappears, and treat a doc that is still present at 30 seconds as a failed phase. The same script covers a grant. Pausing the consumer and setting `FRESHNESS_SLO_MS=1000` returns 503.
 - UI ACL console: grant and revoke the canary, then a freshness probe re-issues the search until the result flips or 30 seconds elapse, and displays the measured propagation.
 
-Exit bar: grant, revoke, and “consumer paused ⇒ 503” tests green against compose.
+Exit bar: `deploy/freshness.sh` shows the grant and the revoke within 30 seconds, and a paused consumer returns 503.
 
 ### Phase 4 — p99 under 100ms with a slow replica
 
@@ -210,11 +210,11 @@ Goal: the SLO, measured, with one replica artificially slow.
 - Coordinator hedging and EWMA ejection as specified in section 1.
 - Singleflight coalescing keyed with ACL epoch.
 - Fault injection: `POST /admin/faults/replica` with `{id, delayMs}` gated by `FAULTS_ENABLED=true`. The UI has a “slow replica” toggle that sets 400ms of injected delay on replica A.
-- Query-path allocation pass: primitive posting cursors, thread-local score buffer, no `Stream`, no autoboxed doc ids. A JMH benchmark fails CI if the coordinator path allocates more than a fixed budget per query (start the budget from the phase-4 measurement, then lock it).
-- Load test (async virtual-thread or a small Java load generator in-repo, so the result is reproducible without a paid SaaS): normal load against the seed, one replica delayed 400ms, assert server-side p99 under 100ms and zero canary leaks. Write `docs/benchmarks/phase4.md` with the histogram, hedge rate, and chosen primary.
+- Query-path allocation pass: primitive posting cursors, thread-local score buffer, no `Stream`, no autoboxed doc ids. A JMH main prints allocations per query; paste the profile into `docs/benchmarks/phase4-alloc.md`.
+- Load generator (a small Java main in-repo): normal load against the seed, one replica delayed 400ms. The process exits 1 when any response is not 200, when the body contains the canary, or when server-side p99 is over 100ms. Write `docs/benchmarks/phase4.md` with the histogram, hedge rate, and chosen primary.
 - `Server-Timing` response header: `index`, `hedge`, `lag`, `replica`.
 
-Exit bar: load test meets p99 with the fault on; killing the fast replica still returns correct results from the slow one within the SLO or a clean 503, never a leaked doc.
+Exit bar: the load generator meets p99 with the fault on; killing the fast replica still returns correct results from the slow one within the SLO or a clean 503, and the canary stays absent.
 
 ## 3. Git Branching and Commit Narrative
 
@@ -228,7 +228,7 @@ Trunk-based, solo-portfolio variant. `main` is always demoable. Each phase is a 
 
 Rebase onto `main` and fast-forward. The published history is linear. Merge commits do not carry the story. Tag the integration points: `v0.1-naive`, `v0.2-prefilter`, `v0.3-freshness`, `v0.4-slo`.
 
-Commit rules: one behavioral change per commit, tests in the same commit as the behavior, benchmark numbers only in the commit that produced them. Subjects are imperative, bodies explain the constraint that forced the change.
+Commit rules: one behavioral change per commit, the `Verify:` commands in that commit, benchmark numbers only in the commit that produced them. Subjects are imperative, bodies explain the constraint that forced the change. There is no `test:` commit.
 
 ### Phase 1 commits
 
@@ -236,8 +236,7 @@ Commit rules: one behavioral change per commit, tests in the same commit as the 
 - `feat: add tenant, document, and allow-grant schema` — default deny is a missing row, not a flag. Unique ACL key.
 - `feat: seed a canary document visible to almost nobody` — shared keywords across tenants so a missing `tenant_id` predicate fails immediately.
 - `feat: search with SQL post-filter before limit` — `EXISTS` grant check inside the candidate query so `LIMIT 10` cannot drop authorized hits.
-- `test: property-check that every hit is tenant-local and granted` — jqwik oracle over random grants; canary test for every user.
-- `feat: add demo search page with principal switcher` — session identity, headers only in demo auth mode.
+- `feat: serve search, grants, and documents over HTTP` — demo headers only in demo auth mode.
 - `docs: record phase-1 latency baseline` — histogram and the sequential-scan plan. The SLO is explicitly unmet.
 
 ### Phase 2 commits
@@ -247,8 +246,7 @@ Commit rules: one behavioral change per commit, tests in the same commit as the 
 - `feat: publish index snapshots through a volatile reference` — readers take no lock.
 - `feat: encode allow-grants as roaring bitmaps per principal` — user bitmap OR group bitmaps AND live docs.
 - `feat: intersect postings with the visibility bitmap before scoring` — rarest term first; bitmap applied when it is the selective leg.
-- `test: diff bitmap results against the SQL oracle` — set equality on top-10 ids, including the low-selectivity case.
-- `docs: record post-filter versus pre-filter as selectivity drops`.
+- `docs: record post-filter versus pre-filter as selectivity drops`. Compare index hits with the oracle on the seed before writing the numbers.
 
 ### Phase 3 commits
 
@@ -257,8 +255,8 @@ Commit rules: one behavioral change per commit, tests in the same commit as the 
 - `feat: apply a transaction at one LSN and ignore replayed offsets` — offset commit after snapshot publish.
 - `feat: subtract a revoke overlay on every query` — grants may lag; revokes cannot leak.
 - `feat: fail closed when the freshest replica lags past 30 seconds`.
-- `test: bound grant and revoke propagation and expect 503 when the consumer is paused`.
-- `feat: show ACL edits and measured propagation in the console`.
+- `feat: record grant and revoke propagation with deploy/freshness.sh`.
+- The console’s ACL panel arrives in phase 5.
 
 ### Phase 4 commits
 
@@ -268,8 +266,8 @@ Commit rules: one behavioral change per commit, tests in the same commit as the 
 - `feat: eject a replica whose hedge rate shows it is slow but alive`.
 - `feat: inject per-replica delay for the slow-copy drill`.
 - `perf: remove query-path allocation from scoring and intersection`.
-- `test: hold p99 under 100ms with one replica delayed` — leaks still zero.
-- `feat: emit Server-Timing and plot session RTT in the UI`.
+- `perf: hold p99 under 100ms with one replica delayed` — the canary stays absent.
+- `feat: emit Server-Timing`. The UI plots session RTT in phase 5.
 
 ## 4. Engineering References
 
@@ -363,10 +361,10 @@ Both layouts are a single column under 768px. The telemetry card stacks under th
 
 ## Verification when this plan is executed
 
-- Unit and property tests on every commit that changes ranking or ACL logic
-- Compose integration tests for freshness and fail-closed behavior
-- JMH allocation budget and the phase-4 load assertion
-- Browser pass on the real UI: switch tenant and user, confirm the canary appears and disappears, abort an in-flight query by typing, toggle the slow replica, read server time off the widget against the 100ms line
+- `psql` and `curl` on every commit that changes ranking or ACL logic, using the seeded canary
+- `deploy/freshness.sh` for grant, revoke, and fail-closed behavior on the Compose stack
+- A JMH allocation profile and the phase-4 load generator, with the numbers written into `docs/benchmarks/`
+- A browser pass on the real UI in phase 5: switch tenant and user, confirm the canary appears and disappears, abort an in-flight query by typing, toggle the slow replica, read server time off the widget against the 100ms line
 
 ## Out of scope for this build
 

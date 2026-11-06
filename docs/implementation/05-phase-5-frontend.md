@@ -29,7 +29,7 @@ npx create-next-app@latest web \
   --turbopack
 ```
 
-If the installed `create-next-app` rejects `--turbopack` or `--no-src-dir`, drop the rejected flag and rerun. Do not add a `src/` directory if you can avoid it. The app router lives at `web/app`.
+If the installed `create-next-app` rejects `--turbopack` or `--no-src-dir`, drop the rejected flag and rerun. Keep the app router at `web/app`. If the scaffolder offers a test runner, skip it, and delete any generated `*.test.*` or `__tests__` directory before the commit. This console has no test suite.
 
 Then:
 
@@ -100,7 +100,7 @@ CORS: the browser calls the coordinator directly. Add to the coordinator, in thi
 - `OPTIONS` returns 204.
 - Any other origin gets no CORS headers.
 
-`CoordinatorCorsTest` covers the allowed origin and an evil origin that receives no allow-origin header.
+`curl -D -` an allowed origin and a second origin. The allowed origin receives `Access-Control-Allow-Origin`. The other origin receives no allow-origin header.
 
 Commit:
 
@@ -113,7 +113,8 @@ two headers, the cache clears on change, and the coordinator only
 emits CORS for the console's origin.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.CoordinatorCorsTest
+curl -sD - -o /dev/null -H 'Origin: http://127.0.0.1:43123' -X OPTIONS http://127.0.0.1:18483/v1/search
+curl -sD - -o /dev/null -H 'Origin: https://evil.example' -X OPTIONS http://127.0.0.1:18483/v1/search
 cd web && npm run build
 ```
 
@@ -242,7 +243,7 @@ The fetch path records `const t0 = performance.now()` before `fetch` and `const 
 
 - Last query: server ms, network ms, replica (`X-Replica`), hedged (`X-Hedged`), lag (`lag` metric).
 - A 100ms mark. The last server sample uses a green text class at or under 100 and an amber class above. Use Tailwind classes, not inline hex, so dark mode stays readable. Compare against `serverMs`, never against `rtt`.
-- The last 50 server samples for this principal. p50 and p99 computed in the browser with the same index rule as the load test: sort a copy, index `Math.ceil(0.99 * n) - 1`.
+- The last 50 server samples for this principal. p50 and p99 computed in the browser with the same index rule as the load generator: sort a copy, index `Math.ceil(0.99 * n) - 1`.
 - Hedge count in those 50.
 
 Reset the sample array inside the principal effect. Ada's samples are not Ivan's p99.
@@ -324,7 +325,7 @@ feat: toggle a slow replica from the console
 
 Why:
 The SLO scenario has to be something you can turn on while looking
-at the card. The toggle calls the same admin route the load test
+at the card. The toggle calls the same admin route the load generator
 calls. A 404 stays visible so a coordinator that booted without
 the flag does not look like a hedge failure.
 

@@ -9,7 +9,7 @@ git checkout main
 git checkout -b feature/phase-4-hedged-slo
 ```
 
-Phase 3's index is correct and fresh. One replica that stalls still stalls the caller. This phase puts two replicas behind a coordinator that hedges, coalesces, and ejects a slow primary. The browser still does not exist. The SLO is a JUnit load test.
+Phase 3's index is correct and fresh. One replica that stalls still stalls the caller. This phase puts two replicas behind a coordinator that hedges, coalesces, and ejects a slow primary. The browser still does not exist. The SLO is the load-generator main. This phase has no test sources.
 
 ## Commit 1 — `feat: run a second index replica in its own consumer group`
 
@@ -35,7 +35,7 @@ They differ:
 | index-a | index-a | index-replica-a | 18481 |
 | index-b | index-b | index-replica-b | 18482 |
 
-Same group id would assign the single partition to one of them. The other would sit idle and every hedge would hit an empty replica. A test in this commit is a comment in the compose file plus `ReplicaGroupsTest`, which reads the compose file as text and asserts the two `CONSUMER_GROUP` values differ. That is a cheap lock on a real outage.
+Same group id would assign the single partition to one of them. The other would sit idle and every hedge would hit an empty replica. A comment in the compose file states that the two `CONSUMER_GROUP` values differ.
 
 Bring both up. `deploy/freshness.sh` still targets `index-a`. Hit `index-b` with the same curl and expect the same Ada ids.
 
@@ -47,7 +47,7 @@ feat: run a second index replica in its own consumer group
 Why:
 Hedging needs two complete copies of the index. A shared consumer
 group with one partition feeds only one copy, so the groups are
-different and a test reads the compose file to keep them different.
+different. The compose comment records that.
 
 Verify:
 both health endpoints ready=true and the same Ada search ids
@@ -57,13 +57,13 @@ both health endpoints ready=true and the same Ada search ids
 
 `settings.gradle.kts` includes `coordinator` and `loadgen`.
 
-`coordinator/build.gradle.kts` depends on `:api`, Jackson, slf4j, logback, JUnit, AssertJ. It does not depend on `:index` or `:oracle`. It has the application plugin, main class `io.aha.index.coord.CoordinatorMain`, default port `18483`.
+`coordinator/build.gradle.kts` depends on `:api`, Jackson, slf4j, and logback. It does not depend on `:index` or `:oracle`. It has the application plugin, main class `io.aha.index.coord.CoordinatorMain`, default port `18483`.
 
 `CoordinatorMain` starts an HTTP server that proxies `GET /v1/search` to `index-a` only, using `java.net.http.HttpClient`. Timeouts: connect 50ms, request 80ms. Forward the principal headers and `X-Request-Id`. Return the upstream body and status. `GET /v1/health` returns the coordinator's own status plus the upstream status code.
 
-This commit is a dumb proxy. Hedging comes next. Tests use a local `HttpServer` as a fake replica on port 0 so the unit test does not need Docker. `CoordinatorProxyTest`: fake replica returns a fixed JSON body, coordinator returns that body, status 200.
+This commit is a dumb proxy. Hedging comes next. Point the coordinator at the Compose index and confirm a search body comes back with status 200.
 
-Writes are not proxied to the index. `POST /v1/documents`, `POST /v1/acl`, `POST /v1/memberships` are proxied to the oracle base URL `ORACLE_URL` default `http://127.0.0.1:18480`. They are a single attempt. No hedge. Test: a second fake "replica" that returns 500 is never called for `POST /v1/acl`.
+Writes are not proxied to the index. `POST /v1/documents`, `POST /v1/acl`, `POST /v1/memberships` are proxied to the oracle base URL `ORACLE_URL` default `http://127.0.0.1:18480`. They are a single attempt. A hedge target is never called for `POST /v1/acl`.
 
 Commit:
 
@@ -76,7 +76,8 @@ straight proxy so the hedge commit is a behavior change on its own.
 Writes go to Postgres through the oracle and are not retried.
 
 Verify:
-./gradlew :coordinator:test
+./gradlew :coordinator:compileJava
+curl -s -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' 'http://127.0.0.1:18483/v1/search?q=quarterly'
 ```
 
 ## Commit 3 — `feat: track replica latency with an EWMA and a p95 ring`
@@ -86,10 +87,10 @@ Verify:
 - `void record(String replicaId, long elapsedMs, boolean success)`
 - `double ewmaMillis(String replicaId)` starts at 20. Alpha `0.2`. Update only on success. `ewma = 0.2 * sample + 0.8 * ewma`.
 - `long p95Millis(String replicaId)` from a ring of 64 successful samples. Until there are 8 samples, return 20. Otherwise copy the occupied slots, `Arrays.sort`, index `floor(0.95 * (n - 1))`.
-- `String primary(List<String> ids, Set<String> ejected)` — lowest EWMA among ids not in `ejected`. Tie-break lexicographic id, so tests are stable.
+- `String primary(List<String> ids, Set<String> ejected)` — lowest EWMA among ids not in `ejected`. Tie-break lexicographic id, so the same inputs always pick the same replica.
 - `String backup(String primary, List<String> ids)` — the other id. Two replicas only. If you pass three, pick the lowest EWMA among the rest. Do not build a general load balancer past that.
 
-`ReplicaStatsTest`:
+Worked checks for `ReplicaStats`:
 
 - Record 100ms, then 100ms. EWMA moves from 20 toward 100. After one sample: `0.2*100+0.8*20 = 36`. Assert that.
 - Fill 64 samples with 10 and one with 500 before the window wraps. p95 is 10 while the 500 has aged out of the 64. A simpler assertion: 20 samples of 10 and 1 sample of 400, with n=21, index `floor(0.95*20)=19` on the sorted array. Sorted is twenty 10s then 400 if you only have 21 values of which 20 are 10. Index 19 is 10. Change the mix so index 19 is the high value: 2 low and 19 high is the wrong lesson. Assert the exact index formula with a hand-computed array of `1,2,3,...,21`. p95 index `floor(0.95*20)=19`, value `20` because the series is 1-based values equal to the rank. Sorted values are 1..21, index 19 is 20. Assert `p95 == 20`.
@@ -106,7 +107,7 @@ fires too often. A fixed hedge on a replica whose p95 is 40ms
 fires too late. The ring is there so the delay is measured.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.ReplicaStatsTest
+./gradlew :coordinator:compileJava
 ```
 
 ## Commit 4 — `feat: hedge the backup replica at the primary p95`
@@ -132,14 +133,14 @@ Algorithm:
 9. If the budget expires, return 503 `INDEX_UNAVAILABLE` when every observed failure was 503, otherwise 502 `UPSTREAM_FAILED`.
 10. At most one backup. There is no third try.
 
-`HedgedSearchTest` with two fake `HttpServer`s:
+With two local `HttpServer`s started from a small `main` you delete after the check:
 
-- Primary sleeps 300ms, backup returns in 5ms. Hedge delay in the test is forced by seeding p95 with samples of 10. Assert the client observes a 200 from the backup's body and the elapsed time is under 150ms.
+- Primary sleeps 300ms, backup returns in 5ms. Hedge delay is forced by seeding p95 with samples of 10. The client observes a 200 from the backup's body and the elapsed time is under 150ms.
 - Primary returns 200 in 5ms. Assert the backup's request count stays 0. Give the backup a counter incremented at the start of its handler.
 - Primary returns 400. Backup's counter stays 0.
-- Both sleep 2 seconds and the deadline is 80ms. Assert 502 or 503, and the test finishes in under 500ms. If it takes 2 seconds, cancellation is broken.
+- Both sleep 2 seconds and the deadline is 80ms. The caller returns 502 or 503 in under 500ms. Two seconds means cancellation is broken.
 
-The fake primary's sleep must be interruptible (`Thread.sleep` in the handler). `HttpServer` will still run it. Cancelling the HTTP future does not abort the server-side sleep. That is fine. The test's assertion is about the caller returning, not about the server stopping. Do not add a thread-kill.
+The fake primary's sleep must be interruptible (`Thread.sleep` in the handler). `HttpServer` will still run it. Cancelling the HTTP future does not abort the server-side sleep. That is fine. The check is that the caller returns. The server-side sleep may continue. Leave that thread alone.
 
 Commit:
 
@@ -153,7 +154,7 @@ backup request, delayed by the primary's own p95 and capped at
 Writes are not on this path.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.HedgedSearchTest
+./gradlew :coordinator:compileJava
 ```
 
 ## Commit 5 — `feat: coalesce in-flight searches that share a replica and an epoch`
@@ -176,7 +177,7 @@ tenant + "\0" + user + "\0" + normalizedQuery + "\0" + replicaId + "\0" + aclEpo
 
 The replica must actually return a changing epoch. Set `aclEpoch` on the index health and search response to `Long.toString(appliedLsn)`. Phase 2 left it as `"0"` on the JDBC path. The log path publishes `appliedLsn`. Thread it into `SearchResponse`.
 
-`SingleFlightTest`:
+Single-flight check:
 
 - Two threads call `doOrJoin` with the same key. The callable increments an atomic counter and sleeps 50ms. Assert the counter is 1 and both threads receive the same value.
 - Two keys that differ by epoch run the callable twice.
@@ -195,7 +196,7 @@ search that started before a revoke does not satisfy a caller who
 arrived after the replica advertised a newer LSN.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.SingleFlightTest
+./gradlew :coordinator:compileJava
 ```
 
 ## Commit 6 — `feat: eject a replica that is alive and slow`
@@ -207,7 +208,7 @@ Inside `ReplicaStats`, a window of 60 seconds:
 - `boolean isEjected(id, now)` is true while `now < ejectedUntil`.
 - An ejected replica is skipped by `primary(...)` and is still eligible as `backup(...)`.
 
-`EjectionTest` feeds 20 attempts with 2 hedges (10%). Assert ejected. Feed 20 attempts with 1 hedge (5%). The condition is `> 0.05`, so 5% is not ejected. Assert not ejected. Advance the fake clock 31 seconds. Assert not ejected.
+Feed 20 attempts with 2 hedges (10%). The replica is ejected. Feed 20 attempts with 1 hedge (5%). The condition is `> 0.05`, so 5% leaves it in the primary set. Advance the clock 31 seconds. It is back in the primary set.
 
 The coordinator records an attempt when a search returns, `hedgeFired` true when the backup was started.
 
@@ -224,7 +225,7 @@ The ejected replica remains a hedge target so a single healthy
 replica is not a single point of failure.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.EjectionTest
+./gradlew :coordinator:compileJava
 ```
 
 ## Commit 7 — `feat: inject delay on one replica`
@@ -234,10 +235,10 @@ On the index process, `POST /admin/faults` with body `{"delayMs":400}`.
 - If env `FAULTS_ENABLED` is not `true`, return 404 `NOT_FOUND` and do not change state.
 - Else set `AtomicLong delayMs`.
 - `QueryEngine.search` calls `Thread.sleep(delayMs.get())` at the start when the value is positive. Catch `InterruptedException`, restore the interrupt flag, and throw `IndexNotReadyException`.
-- `GET /admin/faults` returns the current delay so the test can read it back.
+- `GET /admin/faults` returns the current delay so you can read it back.
 - The coordinator exposes `POST /admin/faults/replica` with `{"replica":"index-a","delayMs":400}` and forwards it to that replica's admin URL, only when the coordinator's own `FAULTS_ENABLED=true`. Otherwise 404. This route is not hedged.
 
-`FaultInjectionTest` on a fake... it needs the real index method. A unit test calls the engine with a delay of 50ms and asserts elapsed `>= 50`. An HTTP test sets `FAULTS_ENABLED=false` and asserts 404.
+Call the engine with a delay of 50ms and see an elapsed time of at least 50ms. With `FAULTS_ENABLED=false`, `POST /admin/faults/replica` returns 404.
 
 Commit:
 
@@ -251,7 +252,7 @@ The flag defaults off so a production-shaped start cannot be paused
 by an anonymous POST.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.FaultInjectionTest
+curl -s -X POST localhost fault route, then a search whose elapsed time includes the delay
 ```
 
 ## Commit 8 — `feat: emit Server-Timing on the coordinator`
@@ -268,9 +269,9 @@ Metrics, each `dur` in milliseconds with one decimal:
 
 Also set response header `X-Replica` to the winner id and `X-Hedged` to `true` or `false`.
 
-`ServerTimingTest` hits the coordinator with two fake replicas, one delayed, and asserts the header contains `hedge;` and `X-Hedged: true`.
+With one replica delayed, the coordinator response contains `hedge;` in `Server-Timing` and `X-Hedged: true`.
 
-On the replica, measure with `System.nanoTime()` around the engine call and around `retainVisible`. Do not include the fault-injection sleep in `index`. Include it in a separate `fault;dur=` metric so a demo can see the stall and the hedge separately. The SLO test looks at `coord`, not at `fault`.
+On the replica, measure with `System.nanoTime()` around the engine call and around `retainVisible`. Do not include the fault-injection sleep in `index`. Include it in a separate `fault;dur=` metric so a demo can see the stall and the hedge separately. The load generator reads `coord`, not `fault`.
 
 Commit:
 
@@ -279,23 +280,23 @@ feat: emit Server-Timing on the coordinator
 
 Why:
 The 100ms line is server time. The header splits index, authz,
-hedge, and coordinator time so a later UI and the load test can
+hedge, and coordinator time so a later UI and the load generator can
 quote the same numbers a client measured.
 
 Verify:
-./gradlew :coordinator:test --tests io.aha.index.coord.ServerTimingTest
+curl -sD - -o /dev/null -H 'X-Tenant-Id: acme' -H 'X-User-Id: ada' 'http://127.0.0.1:18483/v1/search?q=quarterly'
 ```
 
 ## Commit 9 — `perf: keep the scorer off the allocator`
 
-This commit is a pass over `QueryEngine` and `Postings`. You do not change results. `ConfirmedSearchTest` still passes.
+This commit is a pass over `QueryEngine` and `Postings`. Ada's and Ivan's curls stay the same.
 
 Rules you apply, in this order, each as a small edit inside this one commit only if you can still describe it as one performance pass. If the diff gets large, split into `perf:` commits that each name the structure:
 
 1. `Postings.contains` and `tf` use binary search on the primitive array. No `IntStream`, no boxing.
 2. `TopK` stores `int[] ids` and `double[] scores` of length `capacity`. No `PriorityQueue<Scored>` where `Scored` is an object allocated per candidate. A simple insertion into a sorted array of 10 is enough and allocates nothing per offer. Replace `PriorityQueue` if you used it.
 3. `visible(snapshot, user)` still allocates one `RoaringBitmap`. That allocation is allowed. Do not cache it on the snapshot (it depends on the user).
-4. The candidate `int` buffer is taken from a `ThreadLocal<int[]>` of length 256, grown by doubling and stored back if a query needs more. Tests that run queries on many threads each get their own buffer.
+4. The candidate `int` buffer is taken from a `ThreadLocal<int[]>` of length 256, grown by doubling and stored back if a query needs more. Each query thread keeps its own buffer.
 5. Do not build a `List<Integer>`.
 
 JMH lives in the `loadgen` module (or `index/src/jmh` if you prefer one module). A single benchmark `QueryEngineBenchmark` builds the 20_000-doc sparse corpus from phase 2 in memory, with confirm disabled, and scores the sparse user. Run:
@@ -321,59 +322,54 @@ free. The scorer's hot path is primitive arrays plus one bitmap
 OR. The JMH gc profile is the evidence.
 
 Verify:
-ConfirmedSearchTest still green
+Ada and Ivan curls unchanged
 docs/benchmarks/phase4-alloc.md pasted from jmh -prof gc
 ```
 
-## Commit 10 — `test: hold p99 under 100ms with one replica delayed`
+## Commit 10 — `perf: record p99 under 100ms with one replica delayed`
 
 `loadgen` main `io.aha.index.loadgen.SloLoad`:
 
 1. Args or env: `COORDINATOR_URL` default `http://127.0.0.1:18483`, `CONCURRENCY` default `8`, `REQUESTS` default `400`, `PATH` the Ada quarterly search with headers.
 2. A warmup of 50 requests, discarded.
 3. `CONCURRENCY` virtual threads share an atomic counter up to `REQUESTS`.
-4. Each request records coordinator-side elapsed time using `System.nanoTime` around `HttpClient.send`, and also parses `coord;dur=` from `Server-Timing` when present. The assertion uses the `coord` metric when the header is present, and the client elapsed time otherwise.
+4. Each request records coordinator-side elapsed time using `System.nanoTime` around `HttpClient.send`, and also parses `coord;dur=` from `Server-Timing` when present. The recorded time is the `coord` metric when the header is present, and the client elapsed time otherwise.
 5. Fail the process with exit code 1 if any response is not 200, if the body contains `d-canary`, or if p99 of the `coord` samples is `> 100`. p99 index: sort, index `ceil(0.99 * n) - 1`.
 6. Print p50, p99, max, hedge rate (fraction of responses with `X-Hedged: true`).
 
-`SloLoadTest` is a JUnit wrapper that:
+Run it with Compose up, both replicas ready, the coordinator up, and `FAULTS_ENABLED=true`. POST `delayMs=400` to `index-a` and `delayMs=0` to `index-b`, run the main, then set both delays back to 0.
 
-- Skips unless `RUN_SLO=true`.
-- Assumes compose is up, both replicas ready, coordinator up, `FAULTS_ENABLED=true` on all three.
-- POSTs `delayMs=400` to `index-a` and `delayMs=0` to `index-b`.
-- Runs `SloLoad` in-process.
-- Asserts exit criteria above.
-- In `finally`, resets both delays to 0.
-
-This test is allowed to take a few seconds. It is not allowed to flake by asserting client time that includes a cold JVM. The warmup is mandatory.
+The warmup is mandatory so the first samples are not a cold JVM. A few seconds is a normal run.
 
 Write `docs/benchmarks/phase4.md` with the printed line, the fault configuration, and the machine. One sentence: "index-a slept 400ms per query; the coordinator's p99 stayed at or under 100ms; the canary was absent."
 
-If p99 is over 100, do not raise the threshold. Find the cause. Typical causes, in the order you should check:
+If p99 is over 100, leave the threshold at 100 and find the cause. Typical causes, in the order you should check:
 
-1. Confirm SQL is opening a new TCP connection per query. Add a pool of 8 connections (`java.sql` plus a tiny semaphore, or HikariCP `com.zaxxer:HikariCP` — use the current 6.x on Maven Central, 5.1.0 if 6.x will not resolve). One pool per index process.
-2. The hedge delay is larger than 20ms because p95 was poisoned by the slow replica before ejection. Ejection should move the primary to `index-b`. Print which replica won. If `index-a` is still primary, the ejection window is wrong.
-3. JSON of the document body is in the response. It must not be. Hits carry snippet only.
-4. You are hedging `POST` by mistake and serializing on the oracle.
+1. Confirm SQL is opening a new TCP connection per query. Add a pool of 8 connections (`HikariCP`, the version in the catalog). One pool per index process.
+2. The hedge delay is larger than 20ms because p95 was poisoned by the slow replica before ejection. Ejection should move the primary to `index-b`. Print which replica won. When `index-a` is still primary, the ejection window is wrong.
+3. JSON of the document body is in the response. Hits carry a snippet only.
+4. A `POST` is being hedged and serializing on the oracle.
 
 Commit:
 
 ```text
-test: hold p99 under 100ms with one replica delayed
+perf: record p99 under 100ms with one replica delayed
 
 Why:
 This is the SLO. One replica sleeps for 400ms. The coordinator
-p99, the canary, and the status codes are asserted together so a
-fast path that leaks or a correct path that stalls both fail.
+p99, the canary, and the status codes are checked together so a
+fast path that leaks and a correct path that stalls both show up
+in the same run.
 
 Verify:
-RUN_SLO=true ./gradlew :loadgen:test --tests io.aha.index.loadgen.SloLoadTest
+# delayMs=400 on index-a, then:
+java -jar loadgen/build/libs/loadgen-0.1.0-SNAPSHOT.jar
 ```
 
 ## Merge
 
 ```bash
-./gradlew test
+./gradlew assemble
 git checkout main
 git merge --ff-only feature/phase-4-hedged-slo
 git tag -a v0.4-slo -m "Hedged coordinator, p99 under 100ms with one slow replica"
@@ -381,8 +377,8 @@ git tag -a v0.4-slo -m "Hedged coordinator, p99 under 100ms with one slow replic
 
 Exit bar:
 
-- `SloLoadTest` passed once on your machine with the fault enabled, and `docs/benchmarks/phase4.md` has the numbers.
+- The load generator exited 0 once on your machine with the fault enabled, and `docs/benchmarks/phase4.md` has the numbers.
 - Killing `index-b` (the fast one) makes searches return from `index-a` or return 503. They do not return `d-canary`. Try it with `docker compose stop index-b`, curl, then `docker compose start index-b`.
-- `POST /v1/acl` through the coordinator still hits the oracle once. A test covers that.
+- `POST /v1/acl` through the coordinator still hits the oracle once. `curl` it and read a single `committedLsn`.
 - `git tag --list 'v0.4-slo'` prints the tag.
 - There is still no `web/` directory. Phase 5 is next, and only next.

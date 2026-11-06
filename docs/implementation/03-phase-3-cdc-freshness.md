@@ -11,7 +11,7 @@ git checkout -b feature/phase-3-cdc-freshness
 
 You already have a correct index that is stale for grants until restart. This phase feeds it from Postgres logical replication. Revokes stay correct even during lag because `retainVisible` reads current rows. Grants become correct because the consumer adds them to the bitmap. If the consumer is too far behind, search returns 503 instead of a quietly incomplete index.
 
-Still no frontend. The freshness probe is a JUnit test and a curl script.
+Still no frontend. The freshness probe is `deploy/freshness.sh`. This phase has no test sources.
 
 ## Commit 1 — `chore: run Kafka KRaft and Debezium Connect beside Postgres`
 
@@ -236,7 +236,7 @@ Parser `DebeziumParser.parse(String topic, long offset, String valueJson)`:
 - `void onRow(RowChange e)` — append to the buffer for `e.txId`.
 - `void onEnd(TransactionEnd e)` — if `buffer.size() == eventCount`, sort by `totalOrder` and hand the list to the applier, then clear. If the size is smaller, keep the END stored and wait. Rows can theoretically be observed after you have seen END if you ever split topics across threads. You have one thread, and Debezium writes the data topic and the transaction topic independently, so END can arrive before the data events are polled. Store a pending END. When a row arrives, if a pending END exists for that id and the sizes now match, flush. If `buffer.size() > eventCount`, throw. That is a bug in the parser (duplicate offsets). Deduplicate by `(topic, offset)` before buffering: a `Set` of seen offsets per topic, bounded by "we only go forward". If `offset <= lastOffset[topic]`, drop the event.
 
-Tests use JSON strings you type by hand, copied in shape from the Debezium documentation's transaction and envelope examples. One test feeds END before the two row events and asserts the applier sees both rows, in `total_order`, and sees them only once.
+Keep one JSON fixture under `deploy/fixtures/`, copied in shape from the Debezium documentation's transaction and envelope examples. A `main` in the cdc package reads that fixture, feeds END before the two row events, and prints the rows the applier sees. They are both rows, in `total_order`, once each.
 
 Commit:
 
@@ -250,7 +250,7 @@ releases them in total_order. Snapshot reads have no transaction
 and apply immediately.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.cdc.TransactionBufferTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 4 — `feat: apply a transaction into one published snapshot`
@@ -293,7 +293,7 @@ event keeps the same dense id, so replay-from-start does not
 duplicate documents.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.cdc.ApplierTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 5 — `feat: rebuild from the log on start and fail closed when the log is stale`
@@ -328,52 +328,46 @@ is idempotent. Serving a replica whose last event is older than
 30 seconds would hide grants, so search returns 503.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.WatermarkTest
+curl -s http://127.0.0.1:18481/v1/health
 ```
 
-## Commit 6 — `test: bound grant and revoke propagation on a real log`
+## Commit 6 — `feat: show grant and revoke propagation on the compose log`
 
-`FreshnessIT` is a JUnit test tagged `@Tag("docker")`. It is in the default `test` task. It needs Docker.
+`deploy/freshness.sh` runs against the Compose stack. Ports 18480 (oracle writes) and 18481 (index reads).
 
-Use Testcontainers `KafkaContainer` **or** assume the compose stack is already up and skip with a clear message if `127.0.0.1:18083` is closed. Prefer Testcontainers for Kafka plus a Postgres container, and Debezium's connector as a `GenericContainer` on `quay.io/debezium/connect:3.7.0.Final`. That is a lot of wiring. The alternative that you can actually finish: a `@EnabledIf` that hits the compose connector endpoint, with the steps written in `deploy/freshness.sh` so you can also run them by hand.
+1. Compose is up, the connector is registered, and the index is `BOOTSTRAP=log` with `FRESHNESS_SLO_MS=30000`.
+2. Wait until health `ready=true`, or stop at 60 seconds and treat that as a failed run.
+3. The seed is already in Postgres before the connector snapshot, so Ada's search for `quarterly` already returns three hits.
+4. `POST` a grant of `d-legal-1` to USER ada through the oracle. Leave the index process alone.
+5. Poll the index search every 200ms. `d-legal-1` appears within 30 seconds. The script prints the elapsed milliseconds.
+6. Revoke it through the oracle. Poll until `d-legal-1` is gone, within 30 seconds. The confirm path may drop it before the consumer applies the revoke. That still meets the bound.
+7. Stop the consumer. Start the index again with `FRESHNESS_SLO_MS=1000` and do not poll Kafka. After 1500ms, search returns 503.
 
-Do the hand script and the JUnit the same way: JUnit assumes compose is up (`Assumptions.assumeTrue` on the connectors HTTP port). Document `docker compose up -d` in the test's class javadoc. CI without Docker skips. Your machine does not skip.
+Paste the elapsed times into `docs/benchmarks/phase3.md`.
 
-Test body:
-
-1. Start an index process in the same JVM (`LogConsumer` + HTTP on port 0) with `BOOTSTRAP=log`, group id `it-` + random, `FRESHNESS_SLO_MS=30000`.
-2. Wait until health `ready=true` or 60 seconds pass. Fail on timeout.
-3. Seed is already in Postgres before the connector snapshot, so Ada's search for `quarterly` already returns three hits. Assert that.
-4. `POST` a grant of `d-legal-1` to USER ada **through the oracle HTTP** or through `DocumentStore` against the same Postgres. Do not touch the index.
-5. Poll the index search every 200ms. Assert `d-legal-1` appears within 30 seconds. Record the elapsed millis in the assertion message.
-6. Revoke it through Postgres. Poll until `d-legal-1` is gone. The confirm path may make this pass before the consumer applies it. That is acceptable. Assert it is gone within 30 seconds anyway.
-7. Stop the `LogConsumer` thread (a `volatile boolean`). Move the fake clock if this JVM's watermark uses a fake clock; in this test it uses the real clock, so instead set `FRESHNESS_SLO_MS=1000` and sleep 1500ms without polling the consumer, then assert search returns 503. Sleeping 1.5 seconds in one integration test is fine. Sleeping 30 is not, which is why the SLO is configurable.
-
-`deploy/freshness.sh` curls the same sequence against ports 18480 (oracle writes) and 18481 (index reads) and prints the elapsed time. You run it once and paste the elapsed time into `docs/benchmarks/phase3.md`.
-
-Update `GrantIsInvisibleUntilReload`: rename to `GrantBecomesVisibleFromTheLog` only if this IT covers it. Leave the old test in the JDBC suite as `GrantIsInvisibleUntilReloadUnderJdbcBootstrap`, still asserting absence. Both tests stay. They lock the two bootstrap modes.
+`--bootstrap=jdbc` still hides a grant until restart. `--bootstrap=log` shows it. The run script's comment says which flag you are using.
 
 Commit:
 
 ```text
-test: bound grant and revoke propagation on a real log
+feat: show grant and revoke propagation on the compose log
 
 Why:
 The SLO is a wall-clock bound on the path from a Postgres commit
-to a search hit. The JDBC bootstrap test still locks the old
-behavior. The log test locks the new one, and a paused consumer
-with a short SLO returns 503 instead of a stale allow-set.
+to a search hit. JDBC bootstrap still hides a new grant until
+restart. The log path shows it, and a paused consumer with a
+short SLO returns 503.
 
 Verify:
 docker compose -f deploy/docker-compose.yml up -d
 ./deploy/register-connector.sh
-./gradlew :index:test --tests io.aha.index.idx.cdc.FreshnessIT
+./deploy/freshness.sh
 ```
 
 ## Merge
 
 ```bash
-./gradlew test
+./gradlew assemble
 git checkout main
 git merge --ff-only feature/phase-3-cdc-freshness
 git tag -a v0.3-freshness -m "Debezium log, transactional apply, 30s fail-closed watermark"

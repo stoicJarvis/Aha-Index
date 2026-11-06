@@ -7,7 +7,7 @@ Aha-Index is a multi-tenant document search service. For a tenant-scoped user an
 Do not open the frontend guide until `v0.4-slo` is tagged on `main`.
 
 1. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the design you are implementing. Read it once before writing code, and again at the start of each phase.
-2. [docs/implementation/00-before-you-write-code.md](docs/implementation/00-before-you-write-code.md) — tools, git rules, invariants, module layout.
+2. [docs/implementation/00-before-you-write-code.md](docs/implementation/00-before-you-write-code.md) — current step. Tools, git, schema, and the code standard, with why each one is there.
 3. [docs/implementation/01-phase-1-naive-oracle.md](docs/implementation/01-phase-1-naive-oracle.md)
 4. [docs/implementation/02-phase-2-bitmap-prefilter.md](docs/implementation/02-phase-2-bitmap-prefilter.md)
 5. [docs/implementation/03-phase-3-cdc-freshness.md](docs/implementation/03-phase-3-cdc-freshness.md)
@@ -18,8 +18,9 @@ Tick items in [docs/CHECKLIST.md](docs/CHECKLIST.md) as you finish them.
 
 ## Rules you do not relax
 
-- One commit does one thing. Tests land in the same commit as the behavior they lock.
+- One commit does one thing. The `Verify:` block of that commit is a command you run against the process (`psql`, `curl`, a benchmark `main`). This repo has no test suite: no `src/test`, no JUnit, no jqwik, no Testcontainers, no Jest or Playwright.
 - `main` is always demoable. Phase work happens on the feature branch named in that phase's guide. Merge with `git merge --ff-only`, then tag.
-- The phase-1 visibility SQL stays in the repo forever. Later phases call it to confirm candidate hits and to generate the authorized set in tests.
+- The phase-1 visibility SQL stays in the repo forever. Later phases call it to confirm candidate hits before returning them.
+- Schema, SQL, and Java follow [docs/implementation/00-before-you-write-code.md](docs/implementation/00-before-you-write-code.md): parameterized SQL, named constraints, `timestamptz`, a non-owner application role, and row-level security on tenant tables.
 - Frontend code, `package.json`, and Node tooling are created in phase 5. Earlier phases are Java, Postgres, Kafka, and Debezium only.
-- Demo identity headers exist so tests and, later, the switcher can act as a user. The class that reads them is the only place those headers are trusted, and only when `AUTH_MODE=demo`.
+- Demo identity headers exist so the switcher can act as a user. The class that reads them is the only place those headers are trusted, and only when `AUTH_MODE=demo`.

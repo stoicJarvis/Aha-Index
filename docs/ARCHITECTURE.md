@@ -31,7 +31,8 @@ Invariants:
 | Log | Kafka in KRaft mode, the image shipped with that Debezium release | `kafka-clients:4.3.1` |
 | Confirm path | JDBC visibility query over the candidate ids | PostgreSQL JDBC 42.7.x |
 | Query cache | Caffeine, query-token cache only | `com.github.ben-manes.caffeine:caffeine:3.2.0` |
-| Tests | JUnit Jupiter 5.14.4, jqwik 1.10.2, Testcontainers, JMH 1.37 | |
+| Schema | Postgres 16, schema `search`, RLS on tenant tables, app role `aha_app` | [implementation/00-before-you-write-code.md](implementation/00-before-you-write-code.md) section 0.7 |
+| Checks | `psql`, `curl`, `EXPLAIN`, benchmark mains | No JUnit, jqwik, or Testcontainers |
 | UI (last) | Next.js, TypeScript, Tailwind, shadcn/ui | Phase 5 only |
 
 ### Why this runtime
@@ -102,7 +103,7 @@ For this build:
 - Streaming events carry `transaction.id` and `transaction.total_order`. Buffer them until the matching `END` marker arrives with `event_count`. Then apply that buffer in `total_order`, build one snapshot, and publish it with one volatile write.
 - `ready` stays false until a poll returns no records after startup replay. Search on that replica returns 503 while `ready` is false.
 
-Do not also JDBC-load the corpus and then replay Debezium's snapshot. Replaying a snapshot read after a later delete resurrects the row. The JDBC loader from phase 2 remains for unit tests and for the `--bootstrap=jdbc` developer switch. The compose stack uses `--bootstrap=log`.
+Do not also JDBC-load the corpus and then replay Debezium's snapshot. Replaying a snapshot read after a later delete resurrects the row. The JDBC loader from phase 2 remains for the `--bootstrap=jdbc` developer switch. The compose stack uses `--bootstrap=log`.
 
 ### Coordinator
 
@@ -121,7 +122,7 @@ EWMA uses `alpha = 0.2`. The p95 is a 64-sample ring buffer: copy, sort, take in
 
 ### Identity
 
-`AUTH_MODE=demo` (the default in this build) reads `X-Tenant-Id` and `X-User-Id`. `PrincipalResolver` is the only class allowed to do that. `AUTH_MODE=token` ignores those headers. You will not implement real SSO. You will implement the branch and a test that a token-mode server returns 401 when the only identity on the request is those headers.
+`AUTH_MODE=demo` (the default in this build) reads `X-Tenant-Id` and `X-User-Id`. `PrincipalResolver` is the only class allowed to do that. `AUTH_MODE=token` ignores those headers. You will not implement real SSO. You will implement the branch, and a `curl` with only those headers against a token-mode server returns 401.
 
 ### Response shape (stable from phase 1)
 
@@ -153,7 +154,7 @@ EWMA uses `alpha = 0.2`. The p95 is a 64-sample ring buffer: copy, sort, take in
 
 ### Frontend, after the backend SLO
 
-The UI is a harness. It switches tenant and user, searches, grants, revokes, shows propagation delay, and plots server time against a 100ms line. It is built only after `v0.4-slo`. Until then, every check is JUnit, jqwik, Testcontainers, curl, and JMH.
+The UI is a harness. It switches tenant and user, searches, grants, revokes, shows propagation delay, and plots server time against a 100ms line. It is built only after `v0.4-slo`. Until then, every check is `curl`, `psql`, and a benchmark main.
 
 ## Build phases
 
@@ -165,7 +166,7 @@ feature/phase-4-hedged-slo       -> tag v0.4-slo
 feature/web-search-console       -> tag v0.5-console
 ```
 
-Phase 1 is a correct, slow oracle: load every document the user may read, match tokens in the same `Tokenizer` the index will use, rank with a simple count, return 10. Phase 2 adds postings, BM25, and bitmaps, and checks results against that oracle plus an independent BM25 implementation. Phase 3 replaces the startup table-scan bootstrap with the log. Phase 4 adds the second replica, hedging, coalescing, fault injection, and the p99 test. Phase 5 is the UI.
+Phase 1 is a correct, slow oracle: load every document the user may read, match tokens in the same `Tokenizer` the index will use, rank with a simple count, return 10. Phase 2 adds postings, BM25, and bitmaps, and you compare a search against the oracle with `curl`. Phase 3 replaces the startup table-scan bootstrap with the log. Phase 4 adds the second replica, hedging, coalescing, fault injection, and a load generator that prints the p99. Phase 5 is the UI.
 
 ## References to read at the start of each phase
 

@@ -11,6 +11,8 @@ git checkout main
 git checkout -b feature/phase-2-bitmap-prefilter
 ```
 
+This phase has no test sources. Where a check names expected ids or a score, confirm it with `curl` or `psql` against Compose. `./gradlew :index:compileJava` is the compile check.
+
 Phase 2 loads the index from Postgres at startup. A grant committed after startup is invisible to the bitmap until restart. The Postgres candidate check from `DocumentStore.retainVisible` still drops a revoke immediately, because it reads current rows. New grants wait for phase 3. Say that in the module's package javadoc so you do not "fix" it with a cache invalidator.
 
 Add to `settings.gradle.kts`:
@@ -41,20 +43,14 @@ dependencies {
     implementation(libs.slf4j.api)
     implementation(libs.logback)
     implementation(libs.jackson.databind)
-
-    testImplementation(libs.junit.jupiter)
-    testImplementation(libs.jqwik)
-    testImplementation(libs.assertj)
-    testImplementation(libs.testcontainers.junit)
-    testImplementation(libs.testcontainers.postgres)
 }
 ```
 
 Package is `io.aha.index.idx` because `io.aha.index.index` is an unreadable stutter. The module directory stays `index/`.
 
-`IndexMain` prints `index module booted` and exits 0. One test asserts the main method returns without throwing. You will replace the body in the HTTP commit.
+`IndexMain` prints `index module booted` and exits 0. You will replace the body in the HTTP commit.
 
-ZGC lives in `deploy/run-index.sh`, not in the Gradle application plugin, so tests do not require it:
+ZGC lives in `deploy/run-index.sh`, not in the Gradle application plugin:
 
 ```bash
 #!/usr/bin/env bash
@@ -77,7 +73,7 @@ The index is a separate process from the oracle. It may depend on
 the oracle's VisibilityStore. The oracle must not depend on the index.
 
 Verify:
-./gradlew :index:test
+./gradlew :index:compileJava
 ```
 
 ## Commit 2 — `feat: assign dense doc ids and store document records`
@@ -92,7 +88,7 @@ Verify:
 - `int docCount()`
 - Assignment order is the call order. The loader calls `assign` in `ORDER BY doc_id ASC`, so internal order matches external lexicographic order for a full rebuild. Do not renumber. Do not reuse an id after delete in this build. A deleted id is removed from `liveDocs` and stays reserved.
 
-`DocTableTest`: assign `b` then `a`. Internal ids are 0 and 1. Assign `b` again and get 0. This is the opposite of sorted order on purpose, so the test locks "call order", and the loader test later locks "the loader calls in sorted order".
+Assign `b` then `a`. Internal ids are 0 and 1. Assign `b` again and get 0. Assignment follows call order. The loader later calls in sorted external-id order, which is a separate rule.
 
 Commit:
 
@@ -104,7 +100,7 @@ Roaring bitmaps key on 32-bit integers. External ids stay strings
 at the HTTP boundary and become dense ints once, in this table.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.DocTableTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 3 — `feat: build sorted postings lists`
@@ -115,9 +111,9 @@ Verify:
 - `void remove(String term, int docId)` — binary search, `System.arraycopy` the tail down, decrement size. Missing doc id is a no-op.
 - `IntCursor cursor(String term)` — a view of the current array and length. The cursor does not allocate an `Integer`.
 - `int docFreq(String term)` — the length.
-- `int[] raw(String term)` for tests.
+- `int[] raw(String term)` so a caller can see the doc ids in order.
 
-A cursor exposes `boolean next()`, `int docId()`, and `advanceTo(int target)` which moves to the first doc id greater than or equal to `target`. `advanceTo` is galloping: from the current index, step 1, 2, 4, 8… until the value exceeds the target or the list ends, then binary search inside that window. If you skip galloping and binary search the whole array every time, leave a `// TODO gallop` and do not claim the commit done. The test `AdvanceToGallops` uses a list of even ids `0,2,4,...,20000` and `advanceTo(15001)` and asserts the landed id is `15002`.
+A cursor exposes `boolean next()`, `int docId()`, and `advanceTo(int target)` which moves to the first doc id greater than or equal to `target`. `advanceTo` is galloping: from the current index, step 1, 2, 4, 8… until the value exceeds the target or the list ends, then binary search inside that window. If you skip galloping and binary search the whole array every time, leave a `// TODO gallop` and do not claim the commit done. On a list of even ids `0,2,4,...,20000`, `advanceTo(15001)` lands on `15002`.
 
 Commit:
 
@@ -130,7 +126,7 @@ doc-id sequence. Galloping advanceTo is the primitive the query
 walk uses when one list is much shorter than the other.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.PostingsTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 4 — `feat: score with BM25 into a fixed top-10 heap`
@@ -156,7 +152,7 @@ weight    = idf * (tf * (k1 + 1)) / (tf + k1 * norm)
 
 Do not use `PriorityQueue` as the returned order. Drain by polling into a list and reversing, or sort the ten at the end. Ten items. Clarity beats a clever heap drain.
 
-`Bm25Test` worked example. Three live docs, `avgdl = 4`, `N = 3`, every doc contains `quarterly` once, `df = 3`, the scored doc has `dl = 4`, `tf = 1`.
+Worked example. Three live docs, `avgdl = 4`, `N = 3`, every doc contains `quarterly` once, `df = 3`, the scored doc has `dl = 4`, `tf = 1`.
 
 ```text
 idf = ln(1 + 0.5/3.5) = ln(1.142857142857143) = 0.13353139262452263
@@ -166,9 +162,9 @@ weight = idf
 
 Assert `Math.abs(weight - 0.13353139262452263) < 1e-12`.
 
-Second case: a term that appears in all documents still has a positive Lucene-style idf with this formula (`0.5` in the numerator). Do not switch to `log(N/df)`, which would be 0 and would make the canary tests order-unstable.
+Second case: a term that appears in all documents still has a positive Lucene-style idf with this formula (`0.5` in the numerator). `log(N/df)` would be 0 and would make the canary's order depend on tie-break alone.
 
-`TopKTest`: offer 20 docs with scores equal to their id. Drain returns internal ids 19,18,…,10.
+Top-k check: offer 20 docs with scores equal to their id. Drain returns internal ids 19,18,…,10.
 
 Commit:
 
@@ -181,7 +177,7 @@ the SLO demo shows. BM25 is deterministic here: fixed k1 and b,
 doc-id tie break, and an idf that stays positive when a term is common.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.Bm25Test --tests io.aha.index.idx.TopKTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 5 — `feat: publish index snapshots through a volatile field`
@@ -213,7 +209,7 @@ public final class SnapshotPublisher {
 
 That is the whole concurrency protocol. One writer thread calls `publish`. Any number of readers call `current` and then only read. There is no lock on the query path.
 
-`SnapshotPublisherTest`: a reader thread loops for 100ms loading `current()` and reading `liveDocs.getCardinality()` while the writer publishes snapshots with cardinality 0,1,2,…,1000. The reader never throws. Cardinality is whatever snapshot it loaded, and it is allowed to skip values. It is not allowed to observe a negative or a value above 1000. This test will not fail on a correct `volatile` publish. It fails if you publish a snapshot and then keep mutating its bitmap. So the test's writer must mutate only unpublished builders. Add a comment in the test that says that.
+A reader thread may loop, loading `current()` and reading `liveDocs.getCardinality()`, while the writer publishes snapshots with cardinality 0,1,2,…,1000. The reader sees a cardinality from a published snapshot: any value from 0 through 1000, possibly skipping values. Publish only finished builders. A bitmap that is still being mutated is not stored in the volatile field.
 
 Commit:
 
@@ -226,7 +222,7 @@ one, never a bitmap mid-or. Volatile publication is the protocol.
 RoaringBitmap writes stay on the builder side of publish.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.SnapshotPublisherTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 6 — `feat: encode allow-grants as roaring bitmaps`
@@ -237,7 +233,7 @@ Builder `io.aha.index.idx.IndexBuilder`:
 - `grantUser(externalDocId, userId)`, `grantGroup(externalDocId, groupId)`.
 - `addMembership(userId, groupId)`.
 - `deleteDocument(externalDocId)` removes the id from `liveDocs`, from every posting term it contributed (you stored the token list on the doc record), and from every grant bitmap that contains it. Track `Map<Integer, List<Principal>> grantsByDoc` so delete does not scan every bitmap. A second delete is a no-op.
-- `IndexSnapshot build(long appliedLsn, long appliedAtMillis, boolean ready)` computes `avgdl` from live docs, wraps maps in `Map.copyOf`, clones every bitmap (`bitmap.clone()`), clones membership arrays, and returns a snapshot the builder may continue to modify afterwards without the snapshot changing. Test this: grant a user on the builder after `build()`, assert the published snapshot's bitmap does not contain the new doc.
+- `IndexSnapshot build(long appliedLsn, long appliedAtMillis, boolean ready)` computes `avgdl` from live docs, wraps maps in `Map.copyOf`, clones every bitmap (`bitmap.clone()`), clones membership arrays, and returns a snapshot the builder may continue to modify afterwards without the snapshot changing. Grant a user on the builder after `build()`. The published snapshot's bitmap does not contain the new doc.
 
 `Visibility` helper, pure function of a snapshot:
 
@@ -267,7 +263,7 @@ out.and(snap.liveDocs());
 return out;
 ```
 
-`out` is a new bitmap. `direct.or(g)` would mutate the published user bitmap. The test `VisibleDoesNotMutatePublishedGrants` calls `visible` and then asserts the stored user bitmap cardinality is unchanged.
+`out` is a new bitmap. `direct.or(g)` would mutate the published user bitmap. After `visible` returns, the stored user bitmap cardinality is unchanged.
 
 Commit:
 
@@ -281,7 +277,7 @@ on publish and OR-ing into a fresh bitmap are what keep a query
 from permanently granting the user every document in their groups.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.IndexBuilderTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 7 — `feat: intersect postings with the visibility bitmap before scoring`
@@ -332,7 +328,7 @@ Do not reset other cursors inside the loop.
 
 BM25 `tf` is the term frequency stored at index time. You need it. A postings entry is not only a doc id. Change `Postings` in this commit (or a fixup commit if commit 3 is already too far to amend) so each term maps to parallel `int[] docIds` and `int[] tfs`, same length, same order. `add` takes `(term, docId, tf)`. `remove` removes both. `DocTable` already has the token list; the loader passes `termFreq`.
 
-If you notice this only now, that is what this commit is for. Update `PostingsTest` and `Bm25` to read `tf` from the posting, not from a rescan of the body. Rescanning the body is correct and slower. Do the parallel array. A comment in `Postings` should say the two arrays stay the same length.
+If you notice this only now, that is what this commit is for. Update postings and `Bm25` to read `tf` from the posting, not from a rescan of the body. Rescanning the body is correct and slower. Do the parallel array. A comment in `Postings` should say the two arrays stay the same length.
 
 Scoring a candidate:
 
@@ -343,12 +339,12 @@ for term in queryTokens:
     score += bm25.weight(tf, docLen, avgdl, df, N)
 ```
 
-`QueryEngineTest` builds a snapshot in memory, no Postgres:
+Build a snapshot in memory, with no Postgres:
 
 - Three docs, user `ada` granted on doc 0 and doc 2, not doc 1.
 - All three contain `quarterly`.
 - Search returns external ids of doc 0 and doc 2 only.
-- A second test: 100 docs contain `quarterly`, the user can read one of them, the result has size 1. This is the pre-filter test. Count how many docs you scored (add a package-visible counter or return it on a test subclass). Assert `scored == 1`, not 100.
+- A second case: 100 docs contain `quarterly`, the user can read one of them, the result has size 1. Expose how many docs were scored. That count is 1.
 
 Commit:
 
@@ -362,7 +358,7 @@ intersection happens before BM25, and the scored-doc counter locks
 that order.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.QueryEngineTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 8 — `feat: load a snapshot from Postgres and confirm candidates`
@@ -383,17 +379,15 @@ Verify:
 4. Append survivors until you have 10 or you run out.
 5. SQLException from the confirm call becomes `IndexNotReadyException`. The handler returns 503. It does not return the unconfirmed list.
 
-`JdbcBootstrapTest` + `ConfirmedSearchTest` on Testcontainers with the canary seed:
+Against Compose, with the canary seed loaded and the index bootstrapped from JDBC:
 
-- Ada `quarterly` returns `d-ada-1`, `d-eng-1`, `d-shared` in BM25 order. Compute the expected order with `ReferenceBm25` described below, not by calling production `Bm25`.
-- Revoke ada's direct grant on `d-ada-1` in Postgres **without** rebuilding the index. Search again. `d-ada-1` is absent. This is the confirm path. If you skip `retainVisible`, this test fails.
-- Insert a new document granted to ada **without** rebuilding. Search. It is absent. That is expected in phase 2. The test is named `GrantIsInvisibleUntilReload` and its assertion is absence. Phase 3 deletes this behavior. Leave the test, and in phase 3 change it to assert presence within the freshness bound. A comment on the test says so.
-- Canary is absent for ada and present for ivan.
-- `scored` for ada on `quarterly` is far below the number of acme documents. Assert `scored < 10` given the seed (ada can see 3 matching docs). The fillers are not scored.
+- Ada `quarterly` returns `d-ada-1`, `d-eng-1`, `d-shared` in BM25 order. Compute the expected order with a scratch class `ReferenceBm25` that you run once from `main` and then delete, or by hand from the formula in the architecture doc. It calls `Tokenizer` and does not call `io.aha.index.idx.Bm25`.
+- Revoke ada's direct grant on `d-ada-1` in Postgres without rebuilding the index. Search again. `d-ada-1` is absent. That is the confirm path.
+- Insert a new document granted to ada without rebuilding. Search. It is absent. Phase 3 is what makes a new grant visible without a restart. Say that in the class Javadoc.
+- The canary is absent for ada and present for ivan.
+- `scored` for ada on `quarterly` is under 10. Ada can see 3 matching docs. The fillers are not scored.
 
-`ReferenceBm25` lives in `index/src/test/.../ReferenceBm25.java`. Type the formula again from the architecture doc. Do not call `io.aha.index.idx.Bm25`. The test builds tf from `Tokenizer` over the seeded title and body of the oracle's visible, matching documents, computes scores, sorts, and compares external ids to the engine. A bug in production BM25 then fails the test instead of passing twice.
-
-Ranking may differ from phase 1's count score. Do not assert phase-1 order against the index. Assert reference BM25 order, and assert the set of engine hits is a subset of `DocumentStore.visibleDocuments` filtered by the tokenizer match rule.
+Ranking may differ from phase 1's count score. Compare the engine's external ids with the reference BM25 order. The set of hits is a subset of `DocumentStore.visibleDocuments` filtered by the tokenizer match rule.
 
 Commit:
 
@@ -403,11 +397,11 @@ feat: load a snapshot from Postgres and confirm candidates
 Why:
 The bitmap can be stale after a revoke until the process restarts.
 retainVisible on the candidate ids is the check that makes a revoke
-disappear immediately. A grant still waits for a reload; the test
-locks that limitation so phase 3 has something to remove.
+disappear immediately. A grant still waits for a reload. The class
+Javadoc records that limitation so phase 3 has something to remove.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.ConfirmedSearchTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 9 — `feat: serve the index on port 18481`
@@ -421,7 +415,7 @@ Verify:
 
 Startup: migrate is not this process's job. It assumes the schema and the seed already exist. `BOOTSTRAP=jdbc` runs `JdbcBootstrap`. Any other value logs an error and exits 2 in this phase. Phase 3 adds `log`.
 
-`IndexHttpTest` starts Postgres via Testcontainers, runs the seeder, starts the index server on port 0, and repeats the Ada / Ivan canary assertions over HTTP.
+Start the index on port 18481 against Compose and repeat the Ada / Ivan canary curls from phase 1.
 
 `deploy/run-index.sh` uses `PORT=18481` and `BOOTSTRAP=jdbc`.
 
@@ -436,7 +430,7 @@ on 18480 as the writer and the differential oracle. The index serves
 reads from the snapshot.
 
 Verify:
-./gradlew :index:test --tests io.aha.index.idx.IndexHttpTest
+./gradlew :index:compileJava
 ```
 
 ## Commit 10 — `docs: record post-filter cost against pre-filter cost`
@@ -468,7 +462,7 @@ SelectivityBenchmark main, docs/benchmarks/phase2.md filled in
 ## Merge
 
 ```bash
-./gradlew test
+./gradlew assemble
 git checkout main
 git merge --ff-only feature/phase-2-bitmap-prefilter
 git tag -a v0.2-prefilter -m "In-memory postings, BM25, roaring pre-filter, Postgres confirm"
@@ -478,6 +472,6 @@ Exit bar:
 
 - Ada's canary is absent through the index HTTP port.
 - Revoking a grant in Postgres removes it from the next index search without a restart.
-- A new grant does not appear until restart, and a test says so.
+- A new grant does not appear until restart. The class Javadoc says so.
 - `scored` stays tiny for the sparse user.
 - No `web/` directory.

@@ -4,8 +4,9 @@ Tick a line only after that commit is on the phase branch and the verify command
 
 ## Setup
 
-- [ ] JDK 21, Docker Compose, git
-- [ ] First commit is the workbook
+- [✅] JDK 21, Docker Compose, git
+- [✅] First commit is the workbook
+- [ ] Section 0.7 of the setup guide is the schema you will migrate in phase 1
 
 ## Phase 1 — `feature/phase-1-naive-oracle`
 
@@ -17,7 +18,6 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [ ] `feat: list the documents a user can read`
 - [ ] `feat: rank the visible set in memory and return ten hits`
 - [ ] `feat: serve the oracle over HTTP`
-- [ ] `test: lock the leak properties`
 - [ ] `docs: record the phase-1 latency baseline`
 - [ ] Fast-forward `main`, tag `v0.1-naive`
 - [ ] Ada's curl has no canary. Ivan's first hit is the canary. No `web/` directory.
@@ -35,7 +35,7 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [ ] `feat: serve the index on port 18481`
 - [ ] `docs: record post-filter cost against pre-filter cost`
 - [ ] Fast-forward `main`, tag `v0.2-prefilter`
-- [ ] Revoke is visible without restart. New grant is not, and a test says so.
+- [ ] Revoke is visible on the next search without a restart. A new grant waits for a reload.
 
 ## Phase 3 — `feature/phase-3-cdc-freshness`
 
@@ -44,7 +44,7 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [ ] `feat: parse Debezium events and buffer a transaction`
 - [ ] `feat: apply a transaction into one published snapshot`
 - [ ] `feat: rebuild from the log on start and fail closed when the log is stale`
-- [ ] `test: bound grant and revoke propagation on a real log`
+- [ ] `feat: show grant and revoke propagation on the compose log`
 - [ ] Fast-forward `main`, tag `v0.3-freshness`
 - [ ] Grant shows up within 30 seconds. Paused consumer returns 503. Restart replays from the beginning.
 
@@ -59,7 +59,7 @@ Tick a line only after that commit is on the phase branch and the verify command
 - [ ] `feat: inject delay on one replica`
 - [ ] `feat: emit Server-Timing on the coordinator`
 - [ ] `perf: keep the scorer off the allocator`
-- [ ] `test: hold p99 under 100ms with one replica delayed`
+- [ ] `perf: record p99 under 100ms with one replica delayed`
 - [ ] Fast-forward `main`, tag `v0.4-slo`
 - [ ] `docs/benchmarks/phase4.md` has a real p99 at or under 100ms with index-a delayed 400ms
 
